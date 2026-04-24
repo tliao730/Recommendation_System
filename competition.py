@@ -382,10 +382,12 @@ if __name__ == "__main__":
     y_train = [float(r[2]) for r in train_rows]
 
     # -- Step 5: Train XGBoost -------------------------------------------------
+    # Tuned params: depth=8 + n=430 found via grid search + early stopping
+    # on yelp_val.csv (val RMSE improved from 0.9774 -> 0.9759).
     reg = xgb.XGBRegressor(
-        max_depth=6,
+        max_depth=8,
         learning_rate=0.05,
-        n_estimators=300,
+        n_estimators=430,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=5,
@@ -414,19 +416,20 @@ if __name__ == "__main__":
     xgb_preds = reg.predict(X_test)
 
     # -- Step 8: Hybrid blend & write output -----------------------------------
-    # CF weight scales with neighbor count:
-    
+    # CF weight scales with neighbor count.
+    # XGB is now stronger (depth=8, n=430), so we lean on it more at low counts.
+    # CF is most reliable when there are many co-rated neighbors (>=10).
     with open(output_file, "w") as out:
         out.write("user_id,business_id,prediction\n")
         for (uid, bid), xgb_p in zip(test_pairs, xgb_preds):
             cp, ck = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache, top_n=30)
 
-            if ck >= 10:
+            if ck >= 15:
                 cw = 0.35
-            elif ck >= 3:
-                cw = 0.25
+            elif ck >= 5:
+                cw = 0.20
             elif ck >= 1:
-                cw = 0.10
+                cw = 0.05
             else:
                 cw = 0.0
 
