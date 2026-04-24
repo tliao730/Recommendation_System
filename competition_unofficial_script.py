@@ -3,7 +3,6 @@ import sys
 import time
 import json
 import math
-import numpy as np
 import xgboost as xgb
 from pyspark import SparkContext
 
@@ -281,68 +280,6 @@ def cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, cache, top_n=30):
     return _clamp(w * cf + (1.0 - w) * b_ui), len(top)
 
 
-# -- Matrix Factorization (SGD biased SVD) ------------------------------------
-
-def train_mf_sgd(train_rows, n_factors=50, n_epochs=20, lr=0.005, reg=0.02, seed=42):
-    """
-    Biased SVD via mini-batch SGD.
-    pred(u,i) = mu + b_u + b_i + P_u . Q_i
-    Returns (u2i, b2i, P, Q, bu, bi, mu).
-    Cold-start: fall back to mu + b_u or mu + b_i or mu.
-    """
-    np.random.seed(seed)
-
-    all_u = sorted(set(r[0] for r in train_rows))
-    all_b = sorted(set(r[1] for r in train_rows))
-    u2i = {u: i for i, u in enumerate(all_u)}
-    b2i = {b: i for i, b in enumerate(all_b)}
-    n_u, n_b = len(all_u), len(all_b)
-
-    mu = float(np.mean([float(r[2]) for r in train_rows]))
-
-    P  = np.random.normal(0, 0.01, (n_u, n_factors))
-    Q  = np.random.normal(0, 0.01, (n_b, n_factors))
-    bu = np.zeros(n_u)
-    bi = np.zeros(n_b)
-
-    ui_arr = np.array([u2i[r[0]] for r in train_rows], dtype="int32")
-    bi_arr = np.array([b2i[r[1]] for r in train_rows], dtype="int32")
-    ra_arr = np.array([float(r[2]) for r in train_rows], dtype="float64")
-    n = len(ra_arr)
-
-    bs = 2048   # mini-batch size (large enough to vectorize; small enough to stay memory-safe)
-    for _ in range(n_epochs):
-        perm = np.random.permutation(n)
-        for s in range(0, n, bs):
-            idx = perm[s: s + bs]
-            uu  = ui_arr[idx]
-            bb  = bi_arr[idx]
-            rr  = ra_arr[idx]
-            Pu  = P[uu]          # shape (bs, k)
-            Qb  = Q[bb]          # shape (bs, k)
-            err = rr - (mu + bu[uu] + bi[bb] + np.einsum("ij,ij->i", Pu, Qb))
-            # gradient step (approximate for repeated indices in batch, OK for large datasets)
-            P[uu]  += lr * (err[:, None] * Qb - reg * Pu)
-            Q[bb]  += lr * (err[:, None] * Pu - reg * Qb)
-            bu[uu] += lr * (err - reg * bu[uu])
-            bi[bb] += lr * (err - reg * bi[bb])
-
-    return u2i, b2i, P, Q, bu, bi, mu
-
-
-def mf_predict(uid, bid, u2i, b2i, P, Q, bu, bi, mu):
-    ui = u2i.get(uid)
-    bi_i = b2i.get(bid)
-    p = mu
-    if ui is not None:
-        p += bu[ui]
-    if bi_i is not None:
-        p += bi[bi_i]
-    if ui is not None and bi_i is not None:
-        p += float(np.dot(P[ui], Q[bi_i]))
-    return _clamp(p)
-
-
 # -- Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -440,11 +377,23 @@ if __name__ == "__main__":
     # Collect only lightweight string triples (~22 MB), then do dict lookups
     # in Python. Avoids broadcasting large feature maps through JVM heap.
     train_rows = train_rdd.collect()
-    X_train = [list(biz_map.get(r[1], b_default)) + list(usr_map.get(r[0], u_default))
-               for r in train_rows]
+    X_train = []
+    for r in train_rows:
+        uid, bid = r[0], r[1]
+
+        b_feat = list(biz_map.get(bid, b_default))
+        u_feat = list(usr_map.get(uid, u_default))
+
+        u_a = u_avg.get(uid, g_avg)
+        i_a = i_avg.get(bid, g_avg)
+
+        diff = u_a - i_a
+        
+        X_train.append(b_feat + u_feat + [u_a, i_a, diff])
+        
     y_train = [float(r[2]) for r in train_rows]
 
-    # -- Step 5: Train XGBoost --------------------------------------------------
+    # -- Step 5: Train XGBoost -------------------------------------------------
     # Tuned params: depth=8 + n=430 found via grid search + early stopping
     # on yelp_val.csv (val RMSE improved from 0.9774 -> 0.9759).
     reg = xgb.XGBRegressor(
@@ -474,26 +423,41 @@ if __name__ == "__main__":
                   .collect())
 
     # -- Step 7: Batch XGBoost prediction -------------------------------------
-    X_test    = [list(biz_map.get(bid, b_default)) + list(usr_map.get(uid, u_default))
-                 for uid, bid in test_pairs]
+    X_test = []
+    for uid, bid in test_pairs:
+
+        b_feat = list(biz_map.get(bid, b_default))
+        u_feat = list(usr_map.get(uid, u_default))
+        
+        u_a = u_avg.get(uid, g_avg)
+        i_a = i_avg.get(bid, g_avg)
+        
+        diff = u_a - i_a
+
+        X_test.append(b_feat + u_feat + [u_a, i_a, diff])
+        
     xgb_preds = reg.predict(X_test)
 
-    # -- Step 8: XGBoost + CF blend & write output -----------------------------
-    # CF weight scales with neighbour count; XGBoost dominates otherwise.
+    # -- Step 8: Hybrid blend & write output -----------------------------------
+    # CF weight scales with neighbor count.
+    # XGB is now stronger (depth=8, n=430), so we lean on it more at low counts.
+    # CF is most reliable when there are many co-rated neighbors (>=10).
     with open(output_file, "w") as out:
         out.write("user_id,business_id,prediction\n")
         for (uid, bid), xgb_p in zip(test_pairs, xgb_preds):
-            cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache, top_n=30)
+            cp, ck = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache, top_n=30)
 
-            if cf_k >= 15:
-                cw = 0.15
-            elif cf_k >= 5:
-                cw = 0.08
+            if ck >= 15:
+                cw = 0.35
+            elif ck >= 5:
+                cw = 0.20
+            elif ck >= 1:
+                cw = 0.05
             else:
                 cw = 0.0
 
-            pred = cw * cf_p + (1.0 - cw) * float(xgb_p)
-            out.write("{},{},{}\n".format(uid, bid, _clamp(pred)))
+            pred = _clamp(cw * cp + (1.0 - cw) * float(xgb_p))
+            out.write("{},{},{}\n".format(uid, bid, pred))
 
     print("Duration: {:.1f}s".format(time.time() - t0))
     sc.stop()
