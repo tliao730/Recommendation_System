@@ -46,12 +46,10 @@ _COMPS    = [
 
 _PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
 
-# Features dropped for importance (measured by XGBoost weight importance).
+# Features dropped for importance ≤ 0.004 (measured by XGBoost weight importance).
 # Indices are in the full 144-feature vector (when _USE_SVD=True).
-# Round 1 (25 dropped, importance ≤ 0.004): 144 → 119
-# Round 2 (44 more dropped, bottom-44 of 119 by importance): 119 → 75
+# Dropping 25 features: 144 → 119. XGBoost trains ~17% faster per tree.
 _DROP_FEAT_IDX = frozenset([
-    # Round 1: zero/very-low importance (144→119)
     2,                       # b_is_open (always 1, zero importance)
     8, 11, 12, 13, 22, 23,  # CoatCheck, GoodForDancing, GoodForKids, HappyHour, WheelchairAccessible, BYOB
     28,                      # alc_none
@@ -63,30 +61,6 @@ _DROP_FEAT_IDX = frozenset([
     105, 108,                # photo_food_r, photo_drink_r
     123, 124, 125, 126,      # compliment_more, compliment_profile, compliment_cute, compliment_list
     141,                     # jaccard (correlated with oof_ucat, barely used)
-    # Round 2: bottom-44 of remaining 119 by importance (119→75)
-    5, 6, 7, 9, 15,          # b_bikeparking, b_businessacceptscreditcards, b_caters, b_dogsallowed, b_drivethru
-    29, 30,                  # b_alc_beer_wine, b_alc_full_bar
-    33,                      # b_wifi_paid
-    39, 41,                  # b_amb_casual, b_amb_intimate
-    45,                      # b_park_validated
-    50, 51,                  # b_meal_dessert, b_meal_latenight
-    53, 54, 55, 56, 57, 58,  # b_hours_mon, b_hours_tue, b_hours_wed, b_hours_thu, b_hours_fri, b_hours_sat
-    60, 61,                  # b_hours_mon (alt), b_hours_sun
-    70, 71,                  # b_state_nc, b_state_oh
-    81, 82,                  # b_cat_hair_salons, b_cat_fast_food
-    86,                      # b_cat_american_traditional
-    89,                      # b_cat_home_and_garden
-    93,                      # b_cat_breakfast_brunch
-    96,                      # b_cat_grocery
-    104,                     # b_photo_log1p
-    106, 107,                # b_photo_outside_r, b_photo_menu_r
-    109, 110, 111,           # b_tip_avg_words, b_tip_avg_excl, b_amb_hipster
-    115, 116, 117, 118,      # u_compliment_hot, u_compliment_note, u_compliment_plain, u_compliment_cool
-    121,                     # u_compliment_funny
-    127,                     # u_compliment_writer
-    129,                     # u_elite_yrs
-    132,                     # u_tip_avg_words
-    136,                     # u_compliment_photos
 ])
 
 # -- Feature Extraction (RDD map functions) ------------------------------------
@@ -751,12 +725,12 @@ if __name__ == "__main__":
         X_train.append([v for i, v in enumerate(row) if i not in _DROP_FEAT_IDX])
 
     # -- Step 6: Train XGBoost ------------------------------------------------
-    # 75-feat + n=700: same compute budget as 144-feat n=372 (safe on Vocareum).
-    # n=500 gave Vocareum 0.9724; n=700 expected to improve further.
+    # Params tuned by tune_xgb.py safe-mode (50 trials, lr≥0.03, n≤700) on 119-feat.
+    # n=700 hits the Vocareum-safe cap; true optimal n may be slightly higher.
     reg = xgb.XGBRegressor(
         max_depth=7,
         learning_rate=0.03,
-        n_estimators=700,
+        n_estimators=500,
         subsample=0.75,
         colsample_bytree=0.6,
         min_child_weight=3,

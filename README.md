@@ -78,7 +78,7 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | competition.py (132 feat) | 132 feat + OOF SVD, n=372, lr=0.05 + CF blend | 0.9742 |
 | competition.py (164 feat，失敗) | +P_u/Q_i 原始向量（空間不兼容）→ timeout | 2.94（miss:125789） |
 | competition.py (144 feat) | photo/tip/ucat/jaccard/ub_tip, n=372 | 0.9726 |
-| **competition.py（目前最佳）** | 119 feat（刪25個低重要度）, n=700, lr=0.03 | **待測** |
+| **competition.py（目前最佳）** | 75 feat, n=500, lr=0.03 | **0.9725** |
 
 ## 已嘗試但無效的方法
 
@@ -107,7 +107,7 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | 131 feat OOF + n=474 + CF 0.25/0.15 | 0.97465 | 0.9747 |
 | 132 feat OOF SVD + n=372 + CF 0.15/0.05 | 0.9739 | 0.9742 |
 | 144 feat + photo/tip/ucat/jaccard/ub_tip | 0.9726 | 0.9726 |
-| 75 feat, n=500, lr=0.03 (新參數)** | 0.97151 | 0.9724 |
+| 75 feat, n=500, lr=0.03 (新參數)** | 0.97151 | 0.9725 |
 
 ## 下一步可能的改善方向
 
