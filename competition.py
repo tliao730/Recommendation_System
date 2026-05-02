@@ -343,6 +343,21 @@ def mf_predict(uid, bid, u2i, b2i, P, Q, bu, bi, mu):
     return _clamp(p)
 
 
+# ---------------------------------------------------------------------------
+# Tuning flags — change here to trade accuracy vs Vocareum time budget
+# ---------------------------------------------------------------------------
+
+# OOF CF as feature: uses OOF fold averages (removes avg-leakage) but full
+# u2i/i2u + shared cache (minor similarity-leakage remains, fast after fold 0).
+# Estimated Vocareum time: +8-12 min.  Set False → fall back to post-hoc blend.
+_USE_OOF_CF = False
+
+# SVD feature: OOF 5-fold + 1 final train.  n_factors=10, n_epochs=8 per fold.
+# Estimated Vocareum time: +5-6 min.
+_USE_SVD = True
+_MF_FACTORS = 10
+_MF_EPOCHS  = 8   # per OOF fold; final model uses +4 extra epochs
+
 # -- Main ----------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -365,18 +380,14 @@ if __name__ == "__main__":
     train_path = os.path.join(folder_path, "yelp_train.csv")
 
     # -- Step 1: Load & broadcast auxiliary data via RDD ----------------------
-    # Each textFile, map, collectAsMap is a full parallel Spark job.
 
-    # 1a. Business: 102 raw features per business
     biz_raw = sc.textFile(biz_path).map(extract_business).collectAsMap()
 
-    # 1b. Checkin: sum of all checkin counts per business (old Yelp format)
     ck_map = (sc.textFile(ck_path)
                 .map(extract_checkin)
                 .reduceByKey(lambda a, b: a + b)
                 .collectAsMap())
 
-    # 1c. Tip: one pass: split into per-business and per-user counts
     tip_all = (sc.textFile(tip_path)
                  .flatMap(extract_tip)
                  .reduceByKey(lambda a, b: a + b)
@@ -384,19 +395,13 @@ if __name__ == "__main__":
     tb_map = {k[2:]: v for k, v in tip_all.items() if k[:2] == "b_"}
     tu_map = {k[2:]: v for k, v in tip_all.items() if k[:2] == "u_"}
 
-    # 1d. User: 23 raw features per user
     usr_raw = sc.textFile(usr_path).map(extract_user).collectAsMap()
 
-    # Merge auxiliary counts into feature lists
-    # Business: 102, checkin_cnt, tip_biz_cnt = 104 features
     biz_map = {bid: f + [ck_map.get(bid, 0.0), tb_map.get(bid, 0.0)]
                for bid, f in biz_raw.items()}
-
-    # User: 23 and tip_usr_cnt = 24 features
     usr_map = {uid: f + [tu_map.get(uid, 0.0)]
                for uid, f in usr_raw.items()}
 
-    # Cold-start defaults: per-column mean (ignoring -1 sentinel for missing attrs)
     biz_vals  = list(biz_map.values())
     n_bfeat   = len(biz_vals[0]) if biz_vals else 104
     b_default = _col_defaults(biz_vals, n_bfeat)
@@ -405,7 +410,8 @@ if __name__ == "__main__":
     n_ufeat   = len(usr_vals[0]) if usr_vals else 24
     u_default = _col_defaults(usr_vals, n_ufeat)
 
-    # -- Step 2: Load & persist train RDD -------------------------------------
+    # -- Step 2: Load & persist train RDD, build CF structures ----------------
+
     train_raw = sc.textFile(train_path)
     hdr       = train_raw.first()
     train_rdd = (train_raw
@@ -413,8 +419,6 @@ if __name__ == "__main__":
                  .map(lambda s: s.split(","))
                  .persist())
 
-    # -- Step 3: Build CF structures (2 RDD passes on persisted RDD) ----------
-    # Only string/float data flows through Spark here (small), no feature vecs.
     user_data = (train_rdd
                  .map(lambda r: (r[0], (r[1], float(r[2]))))
                  .groupByKey()
@@ -434,76 +438,12 @@ if __name__ == "__main__":
     total_r = sum(len(d) for d in item_data.values())
     g_avg   = sum(sum(d.values()) for d in item_data.values()) / total_r if total_r else 3.75
 
+    # Shared Pearson cache — accumulated across all CF calls (OOF folds + test).
+    # Folds 1-4 reuse similarities computed in fold 0, making later folds fast.
     sim_cache = {}
 
-    # -- Step 4: Build XGBoost training data (Python-side, no JVM) -----------
-    train_rows = train_rdd.collect()
-    y_train    = [float(r[2]) for r in train_rows]
-    n_train    = len(train_rows)
+    # -- Step 3: Load test pairs (early, so sim_cache warms before test eval) --
 
-    # 5-fold OOF u_avg / i_avg: eliminates data leakage while still giving
-    # XGBoost the training-set signal for user/business rating tendencies.
-    import random as _rnd
-    _rnd.seed(42)
-    _shuf = list(range(n_train))
-    _rnd.shuffle(_shuf)
-    _fold = [0] * n_train
-    for _pos, _ki in enumerate(_shuf):
-        _fold[_ki] = _pos % 5
-
-    oof_ua = [g_avg] * n_train
-    oof_ia = [g_avg] * n_train
-    for _k in range(5):
-        _us = {}
-        _uc = {}
-        _bs = {}
-        _bc = {}
-        for _i, r in enumerate(train_rows):
-            if _fold[_i] == _k:
-                continue
-            _y = y_train[_i]
-            _uid = r[0]
-            _bid = r[1]
-            _us[_uid] = _us.get(_uid, 0.0) + _y
-            _uc[_uid] = _uc.get(_uid, 0) + 1
-            _bs[_bid] = _bs.get(_bid, 0.0) + _y
-            _bc[_bid] = _bc.get(_bid, 0) + 1
-        _ua = {u: _us[u] / _uc[u] for u in _us}
-        _ia = {b: _bs[b] / _bc[b] for b in _bs}
-        for _i, r in enumerate(train_rows):
-            if _fold[_i] == _k:
-                oof_ua[_i] = _ua.get(r[0], g_avg)
-                oof_ia[_i] = _ia.get(r[1], g_avg)
-
-    X_train = []
-    for _i, r in enumerate(train_rows):
-        _ua = oof_ua[_i]
-        _ia = oof_ia[_i]
-        X_train.append(list(biz_map.get(r[1], b_default))
-                       + list(usr_map.get(r[0], u_default))
-                       + [_ua, _ia, _ua - _ia])
-
-    # -- Step 5: Train XGBoost --------------------------------------------------
-    # 131 features (128 base + u_avg_train OOF + i_avg_train OOF + diff).
-    # n_estimators=474 found via early stopping on 131-feat model.
-    reg = xgb.XGBRegressor(
-        max_depth=8,
-        learning_rate=0.05,
-        n_estimators=474,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        min_child_weight=5,
-        gamma=0.1,
-        reg_alpha=0.1,
-        reg_lambda=2.0,
-        objective="reg:linear",
-        nthread=4,
-        verbosity=0,
-        seed=42,
-    )
-    reg.fit(X_train, y_train)
-
-    # -- Step 6: Load test pairs via RDD ---------------------------------------
     test_raw   = sc.textFile(test_file)
     test_hdr   = test_raw.first()
     test_pairs = (test_raw
@@ -512,32 +452,170 @@ if __name__ == "__main__":
                   .map(lambda p: (p[0], p[1]))
                   .collect())
 
-    # -- Step 7: Batch XGBoost prediction -------------------------------------
-    # Test features use full training averages (no leakage at prediction time).
+    print("Data loaded: {:.1f}s".format(time.time() - t0))
+
+    # -- Step 4: Collect train rows and compute OOF features ------------------
+
+    train_rows = train_rdd.collect()
+    y_train    = [float(r[2]) for r in train_rows]
+    n_train    = len(train_rows)
+
+    # Fold assignments (deterministic)
+    import random as _rnd
+    _rnd.seed(42)
+    _shuf = list(range(n_train))
+    _rnd.shuffle(_shuf)
+    _fold = [0] * n_train
+    for _pos, _ki in enumerate(_shuf):
+        _fold[_ki] = _pos % 5
+
+    # -- 4a. OOF u_avg / i_avg (no leakage) -----------------------------------
+
+    oof_ua = [g_avg] * n_train
+    oof_ia = [g_avg] * n_train
+    for _k in range(5):
+        _us = {}; _uc = {}; _bs = {}; _bc = {}
+        for _i, r in enumerate(train_rows):
+            if _fold[_i] == _k:
+                continue
+            _y = y_train[_i]; _uid = r[0]; _bid = r[1]
+            _us[_uid] = _us.get(_uid, 0.0) + _y; _uc[_uid] = _uc.get(_uid, 0) + 1
+            _bs[_bid] = _bs.get(_bid, 0.0) + _y; _bc[_bid] = _bc.get(_bid, 0) + 1
+        _ua = {u: _us[u] / _uc[u] for u in _us}
+        _ia = {b: _bs[b] / _bc[b] for b in _bs}
+        for _i, r in enumerate(train_rows):
+            if _fold[_i] == _k:
+                oof_ua[_i] = _ua.get(r[0], g_avg)
+                oof_ia[_i] = _ia.get(r[1], g_avg)
+
+    # -- 4b. OOF CF (approximate) ---------------------------------------------
+    # Approximation: uses full u2i/i2u for neighbor lookup (for cache reuse),
+    # but OOF fold-k averages for baseline — removes the largest leakage source.
+    # sim_cache is shared across folds: fold 0 is slow (cold), folds 1-4 are
+    # fast (cache hits dominate).  Set _USE_OOF_CF=False to skip (~10 min saved).
+
+    oof_cf   = [g_avg] * n_train
+    oof_cf_k = [0]     * n_train
+
+    if _USE_OOF_CF:
+        print("OOF CF start: {:.1f}s".format(time.time() - t0))
+        for _k in range(5):
+            _us = {}; _uc = {}; _bs = {}; _bc = {}
+            for _i, r in enumerate(train_rows):
+                if _fold[_i] == _k:
+                    continue
+                _y = y_train[_i]; _uid = r[0]; _bid = r[1]
+                _us[_uid] = _us.get(_uid, 0.0) + _y; _uc[_uid] = _uc.get(_uid, 0) + 1
+                _bs[_bid] = _bs.get(_bid, 0.0) + _y; _bc[_bid] = _bc.get(_bid, 0) + 1
+            _ua_k = {u: _us[u] / _uc[u] for u in _us}
+            _ia_k = {b: _bs[b] / _bc[b] for b in _bs}
+            for _i, r in enumerate(train_rows):
+                if _fold[_i] == _k:
+                    _p, _nk = cf_predict(r[0], r[1], u2i, i2u,
+                                         _ua_k, _ia_k, g_avg, sim_cache)
+                    oof_cf[_i]   = _p
+                    oof_cf_k[_i] = _nk
+            print("  OOF CF fold {}: {:.1f}s".format(_k, time.time() - t0))
+
+    # -- 4c. OOF SVD ----------------------------------------------------------
+    # 5-fold OOF: train on 80%, predict 20%.  Small model for speed.
+    # Final SVD trains on 100% for test-time predictions.
+
+    oof_svd = [g_avg] * n_train
+    _u2i_final = _b2i_final = _P_f = _Q_f = _bu_f = _bi_f = _mu_f = None
+
+    if _USE_SVD:
+        print("OOF SVD start: {:.1f}s".format(time.time() - t0))
+        for _k in range(5):
+            _rows_k = [train_rows[_i] for _i in range(n_train) if _fold[_i] != _k]
+            _u2i_sv, _b2i_sv, _P, _Q, _bu, _bi, _mu = train_mf_sgd(
+                _rows_k, n_factors=_MF_FACTORS, n_epochs=_MF_EPOCHS, seed=42)
+            for _i in range(n_train):
+                if _fold[_i] == _k:
+                    oof_svd[_i] = mf_predict(
+                        train_rows[_i][0], train_rows[_i][1],
+                        _u2i_sv, _b2i_sv, _P, _Q, _bu, _bi, _mu)
+            print("  OOF SVD fold {}: {:.1f}s".format(_k, time.time() - t0))
+
+        # Final SVD on full training data (used for test features)
+        _u2i_final, _b2i_final, _P_f, _Q_f, _bu_f, _bi_f, _mu_f = train_mf_sgd(
+            train_rows, n_factors=_MF_FACTORS, n_epochs=_MF_EPOCHS + 4, seed=42)
+        print("Final SVD done: {:.1f}s".format(time.time() - t0))
+
+    # -- Step 5: Build XGBoost training matrix --------------------------------
+    # Features: 104 biz + 24 usr + OOF u_avg + OOF i_avg + diff = 131 base
+    # + OOF cf_score + OOF cf_k + is_cold (if _USE_OOF_CF) = +3
+    # + OOF svd_score (if _USE_SVD) = +1
+    # Total: 131 / 134 / 135 depending on flags
+
+    X_train = []
+    for _i, r in enumerate(train_rows):
+        _ua  = oof_ua[_i];  _ia  = oof_ia[_i]
+        _cfk = float(oof_cf_k[_i])
+        row  = (list(biz_map.get(r[1], b_default))
+                + list(usr_map.get(r[0], u_default))
+                + [_ua, _ia, _ua - _ia])
+        if _USE_OOF_CF:
+            row += [oof_cf[_i], _cfk, 1.0 if _cfk < 5 else 0.0]
+        if _USE_SVD:
+            row += [oof_svd[_i]]
+        X_train.append(row)
+
+    # -- Step 6: Train XGBoost ------------------------------------------------
+    # Params from offline tuning (tune_xgb.py, 30 trials on base-131 features).
+    # n_estimators=1359 found via early stopping at lr=0.02.
+    reg = xgb.XGBRegressor(
+        max_depth=8,
+        learning_rate=0.05,
+        n_estimators=372,
+        subsample=0.85,
+        colsample_bytree=0.6,
+        min_child_weight=10,
+        gamma=0.0,
+        reg_alpha=0.5,
+        reg_lambda=2.0,
+        objective="reg:linear",   # Vocareum old XGBoost requires reg:linear
+        nthread=4,
+        verbosity=0,
+        seed=42,
+    )
+    reg.fit(X_train, y_train)
+    print("XGBoost done: {:.1f}s".format(time.time() - t0))
+
+    # -- Step 7: Build X_test -------------------------------------------------
+    # Full training averages (no leakage), full CF (cache now warm), final SVD.
+
     X_test = []
     for uid, bid in test_pairs:
-        _ua = u_avg.get(uid, g_avg)
-        _ia = i_avg.get(bid, g_avg)
-        X_test.append(list(biz_map.get(bid, b_default))
-                      + list(usr_map.get(uid, u_default))
-                      + [_ua, _ia, _ua - _ia])
+        _ua  = u_avg.get(uid, g_avg);  _ia  = i_avg.get(bid, g_avg)
+        row  = (list(biz_map.get(bid, b_default))
+                + list(usr_map.get(uid, u_default))
+                + [_ua, _ia, _ua - _ia])
+        if _USE_OOF_CF:
+            _cf_p, _cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg,
+                                      sim_cache, top_n=30)
+            row += [float(_cf_p), float(_cf_k), 1.0 if _cf_k < 5 else 0.0]
+        if _USE_SVD:
+            row += [mf_predict(uid, bid, _u2i_final, _b2i_final,
+                                _P_f, _Q_f, _bu_f, _bi_f, _mu_f)]
+        X_test.append(row)
+
     xgb_preds = reg.predict(X_test)
 
-    # -- Step 8: XGBoost + CF blend & write output -----------------------------
-    # CF weights tuned on val set sweep: 0.25 (>=15 nbrs), 0.15 (>=5 nbrs).
+    # -- Step 8: Write output -------------------------------------------------
+    # When _USE_OOF_CF=True: XGBoost learned CF weights — no manual blend.
+    # When _USE_OOF_CF=False: fall back to post-hoc CF blend (tuned weights).
+
     with open(output_file, "w") as out:
         out.write("user_id,business_id,prediction\n")
-        for (uid, bid), xgb_p in zip(test_pairs, xgb_preds):
-            cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache, top_n=30)
-
-            if cf_k >= 15:
-                cw = 0.25
-            elif cf_k >= 5:
-                cw = 0.15
+        for idx, ((uid, bid), xgb_p) in enumerate(zip(test_pairs, xgb_preds)):
+            if _USE_OOF_CF:
+                pred = float(xgb_p)
             else:
-                cw = 0.0
-
-            pred = cw * cf_p + (1.0 - cw) * float(xgb_p)
+                cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg,
+                                         g_avg, sim_cache, top_n=30)
+                cw   = 0.15 if cf_k >= 15 else (0.05 if cf_k >= 5 else 0.0)
+                pred = cw * cf_p + (1.0 - cw) * float(xgb_p)
             out.write("{},{},{}\n".format(uid, bid, _clamp(pred)))
 
     print("Duration: {:.1f}s".format(time.time() - t0))
