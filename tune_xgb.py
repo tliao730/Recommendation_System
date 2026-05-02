@@ -8,7 +8,6 @@ Usage:
 Outputs:
     - Top-5 hyperparameter sets ranked by val RMSE
     - Best XGBoost + CF blend weight sweep
-    - Feature ablation: base-131 vs base-131+CF-features (134)
 """
 
 import os
@@ -62,6 +61,11 @@ _COMPS    = [
     "compliment_list", "compliment_note", "compliment_plain", "compliment_cool",
     "compliment_funny", "compliment_writer", "compliment_photos",
 ]
+_PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
+
+_USE_SVD    = True
+_MF_FACTORS = 10
+_MF_EPOCHS  = 8
 
 # ---------------------------------------------------------------------------
 # Feature extraction (no Spark — pure Python file reads)
@@ -89,6 +93,7 @@ def _da(s, k):
 
 
 def load_business(path):
+    """Returns {bid: list[float]} with 102 features. Categories at indices 72..101."""
     biz_map = {}
     with open(path) as f:
         for line in f:
@@ -178,16 +183,57 @@ def load_checkin(path):
 
 
 def load_tip(path):
-    tb_map = {}
-    tu_map = {}
+    """Returns (tb_map, tu_map, tc_b, te_b, tc_u, tip_ub_set)."""
+    tb = {}; tu = {}
+    tc_b_s = {}; tc_b_n = {}; te_b_s = {}
+    tc_u_s = {}; tc_u_n = {}
+    tip_ub = set()
     with open(path) as f:
         for line in f:
             d   = json.loads(line)
             bid = d.get("business_id", "")
             uid = d.get("user_id",     "")
-            tb_map[bid] = tb_map.get(bid, 0.0) + 1.0
-            tu_map[uid] = tu_map.get(uid, 0.0) + 1.0
-    return tb_map, tu_map
+            text = d.get("text", "") or ""
+            wc  = float(len(text.split()))
+            ex  = float(text.count("!"))
+            tb[bid] = tb.get(bid, 0.0) + 1.0
+            tu[uid] = tu.get(uid, 0.0) + 1.0
+            if bid not in tc_b_s:
+                tc_b_s[bid] = 0.0; tc_b_n[bid] = 0; te_b_s[bid] = 0.0
+            tc_b_s[bid] += wc; tc_b_n[bid] += 1; te_b_s[bid] += ex
+            if uid not in tc_u_s:
+                tc_u_s[uid] = 0.0; tc_u_n[uid] = 0
+            tc_u_s[uid] += wc; tc_u_n[uid] += 1
+            tip_ub.add((uid, bid))
+    tc_b = {b: tc_b_s[b] / tc_b_n[b] for b in tc_b_n if tc_b_n[b] > 0}
+    te_b = {b: te_b_s[b] / tc_b_n[b] for b in tc_b_n if tc_b_n[b] > 0}
+    tc_u = {u: tc_u_s[u] / tc_u_n[u] for u in tc_u_n if tc_u_n[u] > 0}
+    return tb, tu, tc_b, te_b, tc_u, tip_ub
+
+
+def load_photo(path):
+    """Returns {bid: [log1p(count), food_r, inside_r, outside_r, drink_r, menu_r]}."""
+    raw = {}
+    with open(path) as f:
+        for line in f:
+            d   = json.loads(line)
+            bid = d.get("business_id", "")
+            lbl = d.get("label", "")
+            if bid not in raw:
+                raw[bid] = [0.0] * 6
+            raw[bid][0] += 1.0
+            for i, pl in enumerate(_PHOTO_LABELS):
+                if lbl == pl:
+                    raw[bid][i + 1] += 1.0
+    photo_map = {}
+    _ph_def = [0.0] * 6
+    for bid, v in raw.items():
+        tot = v[0]
+        if tot > 0:
+            photo_map[bid] = [math.log1p(tot)] + [v[i + 1] / tot for i in range(5)]
+        else:
+            photo_map[bid] = _ph_def[:]
+    return photo_map
 
 
 def load_csv(path):
@@ -211,6 +257,52 @@ def _col_defaults(rows, n_feat):
                 col_cnt[i] += 1
     return [col_sum[i] / col_cnt[i] if col_cnt[i] > 0 else 0.0
             for i in range(n_feat)]
+
+# ---------------------------------------------------------------------------
+# Matrix Factorization (SGD biased SVD) — identical to competition.py
+# ---------------------------------------------------------------------------
+
+def train_mf_sgd(train_rows, n_factors=10, n_epochs=8, lr=0.005, reg=0.02, seed=42):
+    np.random.seed(seed)
+    all_u = sorted(set(r[0] for r in train_rows))
+    all_b = sorted(set(r[1] for r in train_rows))
+    u2i = {u: i for i, u in enumerate(all_u)}
+    b2i = {b: i for i, b in enumerate(all_b)}
+    mu  = float(np.mean([float(r[2]) for r in train_rows]))
+    P   = np.random.normal(0, 0.01, (len(all_u), n_factors))
+    Q   = np.random.normal(0, 0.01, (len(all_b), n_factors))
+    bu  = np.zeros(len(all_u))
+    bi  = np.zeros(len(all_b))
+    ui_arr = np.array([u2i[r[0]] for r in train_rows], dtype="int32")
+    bi_arr = np.array([b2i[r[1]] for r in train_rows], dtype="int32")
+    ra_arr = np.array([float(r[2]) for r in train_rows], dtype="float64")
+    n   = len(ra_arr)
+    bs  = 2048
+    for _ in range(n_epochs):
+        perm = np.random.permutation(n)
+        for s in range(0, n, bs):
+            idx = perm[s: s + bs]
+            uu  = ui_arr[idx]; bb = bi_arr[idx]; rr = ra_arr[idx]
+            Pu  = P[uu];       Qb = Q[bb]
+            err = rr - (mu + bu[uu] + bi[bb] + np.einsum("ij,ij->i", Pu, Qb))
+            P[uu]  += lr * (err[:, None] * Qb - reg * Pu)
+            Q[bb]  += lr * (err[:, None] * Pu - reg * Qb)
+            bu[uu] += lr * (err - reg * bu[uu])
+            bi[bb] += lr * (err - reg * bi[bb])
+    return u2i, b2i, P, Q, bu, bi, mu
+
+
+def mf_predict(uid, bid, u2i, b2i, P, Q, bu, bi, mu):
+    ui   = u2i.get(uid)
+    bi_i = b2i.get(bid)
+    p    = mu
+    if ui is not None:
+        p += bu[ui]
+    if bi_i is not None:
+        p += bi[bi_i]
+    if ui is not None and bi_i is not None:
+        p += float(np.dot(P[ui], Q[bi_i]))
+    return 1.0 if p < 1.0 else (5.0 if p > 5.0 else p)
 
 # ---------------------------------------------------------------------------
 # Item-based CF (identical to competition.py)
@@ -246,7 +338,6 @@ def _pearson(i, j, i2u, i_avg, cache):
 
 
 def cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, cache, top_n=30):
-    """Returns (prediction, neighbor_count)."""
     has_u = uid in u2i
     has_i = bid in i2u
     if not has_u and not has_i:
@@ -279,12 +370,13 @@ def cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, cache, top_n=30):
     return _clamp(w * cf + (1.0 - w) * b_ui), len(top)
 
 # ---------------------------------------------------------------------------
-# OOF averages
+# OOF averages + ucat (5-fold, consistent with competition.py)
 # ---------------------------------------------------------------------------
 
-def compute_oof_avgs(train_rows, g_avg, n_folds=5, seed=42):
-    n = len(train_rows)
-    y = [r[2] for r in train_rows]
+def compute_oof(train_rows, biz_cats, g_avg, n_folds=5, seed=42):
+    """Returns (oof_ua, oof_ia, oof_ucat, fold_ids)."""
+    n   = len(train_rows)
+    y   = [r[2] for r in train_rows]
     rng = random.Random(seed)
     shuf = list(range(n))
     rng.shuffle(shuf)
@@ -292,53 +384,92 @@ def compute_oof_avgs(train_rows, g_avg, n_folds=5, seed=42):
     for pos, ki in enumerate(shuf):
         fold[ki] = pos % n_folds
 
-    oof_ua = [g_avg] * n
-    oof_ia = [g_avg] * n
+    oof_ua   = [g_avg] * n
+    oof_ia   = [g_avg] * n
+    oof_ucat = [g_avg] * n
+
     for k in range(n_folds):
         us = {}; uc = {}; bs = {}; bc = {}
+        u_cat_sum = {}; u_cat_cnt = {}
         for i, r in enumerate(train_rows):
             if fold[i] == k:
                 continue
             yi = y[i]; uid = r[0]; bid = r[1]
             us[uid] = us.get(uid, 0.0) + yi;  uc[uid] = uc.get(uid, 0) + 1
             bs[bid] = bs.get(bid, 0.0) + yi;  bc[bid] = bc.get(bid, 0) + 1
+            if uid not in u_cat_sum:
+                u_cat_sum[uid] = [0.0] * 30
+                u_cat_cnt[uid] = [0]   * 30
+            for ci in biz_cats.get(bid, []):
+                u_cat_sum[uid][ci] += yi
+                u_cat_cnt[uid][ci] += 1
         ua_k = {u: us[u] / uc[u] for u in us}
         ia_k = {b: bs[b] / bc[b] for b in bs}
         for i, r in enumerate(train_rows):
             if fold[i] == k:
-                oof_ua[i] = ua_k.get(r[0], g_avg)
-                oof_ia[i] = ia_k.get(r[1], g_avg)
-    return oof_ua, oof_ia
+                uid, bid = r[0], r[1]
+                oof_ua[i]   = ua_k.get(uid, g_avg)
+                oof_ia[i]   = ia_k.get(bid, g_avg)
+                cats = biz_cats.get(bid, [])
+                vals = []
+                if uid in u_cat_sum:
+                    for ci in cats:
+                        if u_cat_cnt[uid][ci] > 0:
+                            vals.append(u_cat_sum[uid][ci] / u_cat_cnt[uid][ci])
+                oof_ucat[i] = sum(vals) / len(vals) if vals else g_avg
+
+    return oof_ua, oof_ia, oof_ucat, fold
 
 # ---------------------------------------------------------------------------
-# Feature matrix building
+# Feature matrix building (144 features when _USE_SVD=True)
 # ---------------------------------------------------------------------------
 
 def build_features(rows, biz_map, usr_map, u_avg, i_avg, g_avg,
                    b_default, u_default, u2i, i2u, sim_cache,
-                   oof_ua=None, oof_ia=None, add_cf=True):
+                   biz_cats, u_cat_sum_all, u_cat_cnt_all, u_cats_set,
+                   tip_ub_set,
+                   oof_ua=None, oof_ia=None, oof_ucat=None,
+                   oof_svd=None, svd_params=None):
     """
-    Returns X (np.ndarray, float32), cf_preds (array), cf_ks (array).
-
-    oof_ua / oof_ia: if provided (same length as rows), used as the
-    u_avg/i_avg features instead of the full-data averages.  Pass None
-    for val/test rows (which use full training averages — no leakage).
-
-    add_cf: if True, append cf_score, cf_k, is_cold as extra features.
-    CF is always computed from the full training u2i/i2u; val is clean
-    because it was never in the training structures.
-    Training CF has minor self-inclusion leakage, acceptable for tuning.
+    Feature layout (144 when _USE_SVD=True):
+      112 biz  : 102 base + ck + tb + 6 photo + tip_avg_wc + tip_avg_excl
+      25  user : 23 base + tu + tip_avg_wc
+      6   pair : OOF u_avg, OOF i_avg, diff, OOF ucat, jaccard, ub_tip_flag
+      +1  SVD  : svd_score (if svd params provided)
     """
-    X         = []
-    cf_preds  = []
-    cf_ks     = []
+    X        = []
+    cf_preds = []
+    cf_ks    = []
     for idx, row in enumerate(rows):
-        uid = row[0];  bid = row[1]
-        ua  = oof_ua[idx] if oof_ua is not None else u_avg.get(uid, g_avg)
-        ia  = oof_ia[idx] if oof_ia is not None else i_avg.get(bid, g_avg)
+        uid, bid = row[0], row[1]
+        ua = oof_ua[idx]   if oof_ua   is not None else u_avg.get(uid, g_avg)
+        ia = oof_ia[idx]   if oof_ia   is not None else i_avg.get(bid, g_avg)
+        if oof_ucat is not None:
+            ucat = oof_ucat[idx]
+        else:
+            cats = biz_cats.get(bid, [])
+            vals = []
+            if uid in u_cat_sum_all:
+                for ci in cats:
+                    if u_cat_cnt_all[uid][ci] > 0:
+                        vals.append(u_cat_sum_all[uid][ci] / u_cat_cnt_all[uid][ci])
+            ucat = sum(vals) / len(vals) if vals else g_avg
+        uc    = u_cats_set.get(uid, set())
+        bc    = set(biz_cats.get(bid, []))
+        union = len(uc | bc)
+        jac   = float(len(uc & bc)) / union if union > 0 else 0.0
+        ubtip = 1.0 if (uid, bid) in tip_ub_set else 0.0
+
         feat = (list(biz_map.get(bid, b_default))
                 + list(usr_map.get(uid, u_default))
-                + [ua, ia, ua - ia])
+                + [ua, ia, ua - ia, ucat, jac, ubtip])
+
+        if oof_svd is not None:
+            feat.append(oof_svd[idx])
+        elif svd_params is not None:
+            u2i_f, b2i_f, P, Q, bu, bi, mu = svd_params
+            feat.append(mf_predict(uid, bid, u2i_f, b2i_f, P, Q, bu, bi, mu))
+
         X.append(feat)
         cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache)
         cf_preds.append(cf_p)
@@ -347,13 +478,6 @@ def build_features(rows, biz_map, usr_map, u_avg, i_avg, g_avg,
     X_arr  = np.array(X, dtype=np.float32)
     cp_arr = np.array(cf_preds, dtype=np.float32)
     ck_arr = np.array(cf_ks,    dtype=np.float32)
-
-    if add_cf:
-        is_cold = (ck_arr < 5).astype(np.float32)
-        X_arr = np.hstack([X_arr,
-                           cp_arr.reshape(-1, 1),
-                           ck_arr.reshape(-1, 1),
-                           is_cold.reshape(-1, 1)])
     return X_arr, cp_arr, ck_arr
 
 # ---------------------------------------------------------------------------
@@ -368,51 +492,40 @@ def rmse(y_true, y_pred):
 # Hyperparameter random search
 # ---------------------------------------------------------------------------
 
-# Search space — comment out a line to exclude it from the sweep.
 PARAM_GRID = {
     "max_depth":        [6, 7, 8, 9, 10],
     "learning_rate":    [0.02, 0.03, 0.05, 0.07, 0.1],
     "subsample":        [0.7, 0.75, 0.8, 0.85, 0.9],
-    "colsample_bytree": [0.6, 0.7, 0.8, 0.9],
-    "min_child_weight": [3, 5, 7, 10],
+    "colsample_bytree": [0.5, 0.6, 0.7, 0.8],
+    "min_child_weight": [3, 5, 7, 10, 15],
     "gamma":            [0.0, 0.05, 0.1, 0.2, 0.3],
-    "reg_alpha":        [0.0, 0.05, 0.1, 0.2, 0.5],
+    "reg_alpha":        [0.0, 0.05, 0.1, 0.2, 0.5, 1.0],
     "reg_lambda":       [1.0, 1.5, 2.0, 3.0, 4.0],
 }
 
 
 def random_search(X_tr, y_tr, X_val, y_val, n_trials=30, seed=42):
-    """
-    For each trial: sample random params, train with early stopping on val set,
-    record (val_rmse, best_n_trees, params).  Returns list sorted by val_rmse.
-    """
-    rng     = random.Random(seed)
-    y_tr_np = np.array(y_tr, dtype=np.float32)
+    rng      = random.Random(seed)
+    y_tr_np  = np.array(y_tr, dtype=np.float32)
     y_val_np = np.array(y_val, dtype=np.float32)
     results  = []
 
     for trial in range(n_trials):
         params = {k: rng.choice(v) for k, v in PARAM_GRID.items()}
-
-        model = xgb.XGBRegressor(
+        model  = xgb.XGBRegressor(
             n_estimators=1500,
             early_stopping_rounds=50,
-            objective="reg:squarederror",   # local Python 3.13+
+            objective="reg:squarederror",
             nthread=4,
             verbosity=0,
             seed=seed,
             **params,
         )
-        model.fit(
-            X_tr, y_tr_np,
-            eval_set=[(X_val, y_val_np)],
-            verbose=False,
-        )
+        model.fit(X_tr, y_tr_np, eval_set=[(X_val, y_val_np)], verbose=False)
         best_n = model.best_iteration + 1
         preds  = model.predict(X_val)
         val_r  = rmse(y_val_np, preds)
         results.append((val_r, best_n, params))
-
         print(
             f"  trial {trial+1:3d}/{n_trials} | RMSE={val_r:.5f} | "
             f"n={best_n:4d} | depth={params['max_depth']} "
@@ -423,11 +536,10 @@ def random_search(X_tr, y_tr, X_val, y_val, n_trials=30, seed=42):
     return results
 
 # ---------------------------------------------------------------------------
-# CF blend weight sweep (post-hoc, over val predictions)
+# CF blend weight sweep
 # ---------------------------------------------------------------------------
 
 def sweep_blend(xgb_preds, cf_preds, cf_ks, y_val):
-    """Grid search over cw_hi (>=15 nbrs) and cw_lo (>=5 nbrs)."""
     cw_options = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
     best = (float("inf"), 0.0, 0.0)
     for cw_hi in cw_options:
@@ -462,25 +574,37 @@ def main():
     t0 = time.time()
     print("=== Loading data ===")
 
-    biz_raw       = load_business(os.path.join(folder, "business.json"))
-    ck_map        = load_checkin(os.path.join(folder, "checkin.json"))
-    tb_map, tu_map = load_tip(os.path.join(folder, "tip.json"))
-    usr_raw       = load_user(os.path.join(folder, "user.json"))
+    biz_raw  = load_business(os.path.join(folder, "business.json"))
+    ck_map   = load_checkin(os.path.join(folder, "checkin.json"))
+    usr_raw  = load_user(os.path.join(folder, "user.json"))
+    tb_map, tu_map, tc_b, te_b, tc_u, tip_ub_set = load_tip(
+        os.path.join(folder, "tip.json"))
+    photo_map = load_photo(os.path.join(folder, "photo.json"))
 
-    biz_map = {bid: f + [ck_map.get(bid, 0.0), tb_map.get(bid, 0.0)]
-               for bid, f in biz_raw.items()}   # 104 features
-    usr_map = {uid: f + [tu_map.get(uid, 0.0)]
-               for uid, f in usr_raw.items()}   # 24 features
+    _ph_def = [0.0] * 6
+    biz_map = {bid: (f
+                     + [ck_map.get(bid, 0.0), tb_map.get(bid, 0.0)]
+                     + photo_map.get(bid, _ph_def)
+                     + [tc_b.get(bid, 0.0), te_b.get(bid, 0.0)])
+               for bid, f in biz_raw.items()}   # 112 features
+    usr_map = {uid: f + [tu_map.get(uid, 0.0), tc_u.get(uid, 0.0)]
+               for uid, f in usr_raw.items()}   # 25 features
 
     biz_vals  = list(biz_map.values())
-    b_default = _col_defaults(biz_vals, len(biz_vals[0]) if biz_vals else 104)
+    b_default = _col_defaults(biz_vals, len(biz_vals[0]) if biz_vals else 112)
     usr_vals  = list(usr_map.values())
-    u_default = _col_defaults(usr_vals, len(usr_vals[0]) if usr_vals else 24)
+    u_default = _col_defaults(usr_vals, len(usr_vals[0]) if usr_vals else 25)
+
+    # category indices 72..101 in biz_raw (30 categories)
+    biz_cats = {}
+    for bid, f in biz_raw.items():
+        biz_cats[bid] = [j for j in range(30) if len(f) > 72 + j and f[72 + j] == 1.0]
 
     train_rows = load_csv(os.path.join(folder, "yelp_train.csv"))
     val_rows   = load_csv(os.path.join(folder, "yelp_val.csv"))
     y_train    = [r[2] for r in train_rows]
     y_val      = [r[2] for r in val_rows]
+    n_train    = len(train_rows)
 
     # CF structures from full training data
     u2i = {}; i2u = {}
@@ -492,69 +616,104 @@ def main():
     total_r = sum(len(d) for d in i2u.values())
     g_avg   = sum(sum(d.values()) for d in i2u.values()) / total_r if total_r else 3.75
 
-    print(f"Train={len(train_rows)}, Val={len(val_rows)}, g_avg={g_avg:.4f}")
+    print(f"Train={n_train}, Val={len(val_rows)}, g_avg={g_avg:.4f}")
 
-    # OOF u_avg / i_avg for training rows (no leakage)
-    print("Computing OOF averages...")
-    oof_ua, oof_ia = compute_oof_avgs(train_rows, g_avg)
+    # Full training ucat (for val rows)
+    u_cat_sum_all = {}; u_cat_cnt_all = {}; u_cats_set = {}
+    for i, r in enumerate(train_rows):
+        uid, bid = r[0], r[1]
+        if uid not in u_cat_sum_all:
+            u_cat_sum_all[uid] = [0.0] * 30
+            u_cat_cnt_all[uid] = [0]   * 30
+            u_cats_set[uid]    = set()
+        for ci in biz_cats.get(bid, []):
+            u_cat_sum_all[uid][ci] += y_train[i]
+            u_cat_cnt_all[uid][ci] += 1
+            u_cats_set[uid].add(ci)
 
-    # -----------------------------------------------------------------------
-    # Feature matrices — two variants:
-    #   A) base-131  (104 biz + 24 usr + OOF u_avg + OOF i_avg + diff)
-    #   B) base-134  (A + cf_score + cf_k + is_cold)
-    # -----------------------------------------------------------------------
+    print("Computing OOF averages + ucat...")
+    oof_ua, oof_ia, oof_ucat, fold = compute_oof(train_rows, biz_cats, g_avg)
+
+    # OOF SVD
+    oof_svd     = None
+    svd_params  = None
+    if _USE_SVD:
+        print("Computing OOF SVD...")
+        oof_svd = [g_avg] * n_train
+        for k in range(5):
+            rows_k = [train_rows[i] for i in range(n_train) if fold[i] != k]
+            u2i_sv, b2i_sv, P, Q, bu_sv, bi_sv, mu_sv = train_mf_sgd(
+                rows_k, _MF_FACTORS, _MF_EPOCHS, seed=42)
+            for i in range(n_train):
+                if fold[i] == k:
+                    oof_svd[i] = mf_predict(
+                        train_rows[i][0], train_rows[i][1],
+                        u2i_sv, b2i_sv, P, Q, bu_sv, bi_sv, mu_sv)
+        print("Training final SVD...")
+        svd_params = train_mf_sgd(train_rows, _MF_FACTORS, _MF_EPOCHS + 4, seed=42)
+
     print("Building features (this takes ~60s for CF)...")
     sim_cache = {}
+    common_kw = dict(
+        biz_cats=biz_cats,
+        u_cat_sum_all=u_cat_sum_all, u_cat_cnt_all=u_cat_cnt_all,
+        u_cats_set=u_cats_set, tip_ub_set=tip_ub_set,
+    )
 
-    X_tr_full, cf_preds_tr, cf_ks_tr = build_features(
+    X_tr, cf_preds_tr, cf_ks_tr = build_features(
         train_rows, biz_map, usr_map, u_avg, i_avg, g_avg,
         b_default, u_default, u2i, i2u, sim_cache,
-        oof_ua=oof_ua, oof_ia=oof_ia, add_cf=True,
-    )
-    X_val_full, cf_preds_val, cf_ks_val = build_features(
+        oof_ua=oof_ua, oof_ia=oof_ia, oof_ucat=oof_ucat,
+        oof_svd=oof_svd, svd_params=None, **common_kw)
+
+    X_val, cf_preds_val, cf_ks_val = build_features(
         val_rows, biz_map, usr_map, u_avg, i_avg, g_avg,
         b_default, u_default, u2i, i2u, sim_cache,
-        oof_ua=None, oof_ia=None, add_cf=True,
+        oof_ua=None, oof_ia=None, oof_ucat=None,
+        oof_svd=None, svd_params=svd_params, **common_kw)
+
+    print(f"Feature dim: {X_tr.shape[1]} (train), {X_val.shape[1]} (val)")
+    print(f"Data + feature build: {time.time()-t0:.1f}s\n")
+
+    # -----------------------------------------------------------------------
+    # Baseline: current known-good params (n=372, tuned for 132-feat)
+    # -----------------------------------------------------------------------
+    print("=== Baseline (current competition.py params) ===")
+    m_base = xgb.XGBRegressor(
+        n_estimators=372, max_depth=8, learning_rate=0.05,
+        subsample=0.85, colsample_bytree=0.6, min_child_weight=10,
+        gamma=0.0, reg_alpha=0.5, reg_lambda=2.0,
+        objective="reg:squarederror", nthread=4, verbosity=0, seed=42,
     )
-
-    # Base-131 slices (drop last 3 CF columns)
-    X_tr_base  = X_tr_full[:, :-3]
-    X_val_base = X_val_full[:, :-3]
-
-    print(f"Feature dims: base={X_tr_base.shape[1]}, full={X_tr_full.shape[1]}")
-    print(f"Feature build: {time.time()-t0:.1f}s\n")
+    m_base.fit(X_tr, np.array(y_train, dtype=np.float32))
+    r_base = rmse(y_val, m_base.predict(X_val))
+    print(f"  n=372 (old params): RMSE={r_base:.5f}\n")
 
     # -----------------------------------------------------------------------
-    # Quick baseline check with current known-good params
+    # Find optimal n with current params (early stopping, quick)
     # -----------------------------------------------------------------------
-    def quick_eval(X_tr, X_val, label):
-        m = xgb.XGBRegressor(
-            n_estimators=474, max_depth=8, learning_rate=0.05,
-            subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
-            gamma=0.1, reg_alpha=0.1, reg_lambda=2.0,
-            objective="reg:squarederror", nthread=4, verbosity=0, seed=42,
-        )
-        m.fit(X_tr, np.array(y_train, dtype=np.float32))
-        r = rmse(y_val, m.predict(X_val))
-        print(f"  baseline ({label}) RMSE={r:.5f}")
-        return m, r
-
-    print("=== Baseline (n=474, known-good params) ===")
-    m_base, r_base = quick_eval(X_tr_base,  X_val_base,  "base-131")
-    m_full, r_full = quick_eval(X_tr_full,  X_val_full,  "base+CF-134")
-    print()
+    print("=== Finding optimal n_estimators (early stopping, current params) ===")
+    m_es = xgb.XGBRegressor(
+        n_estimators=1500,
+        early_stopping_rounds=50,
+        max_depth=8, learning_rate=0.05,
+        subsample=0.85, colsample_bytree=0.6, min_child_weight=10,
+        gamma=0.0, reg_alpha=0.5, reg_lambda=2.0,
+        objective="reg:squarederror", nthread=4, verbosity=0, seed=42,
+    )
+    m_es.fit(X_tr, np.array(y_train, dtype=np.float32),
+             eval_set=[(X_val, np.array(y_val, dtype=np.float32))], verbose=False)
+    best_n_es = m_es.best_iteration + 1
+    r_es = rmse(y_val, m_es.predict(X_val))
+    print(f"  best n={best_n_es}, RMSE={r_es:.5f}\n")
 
     # -----------------------------------------------------------------------
-    # Random search — tune on whichever feature set is better
+    # Random search (full param sweep)
     # -----------------------------------------------------------------------
-    use_full = r_full <= r_base
-    X_tr_tune  = X_tr_full  if use_full else X_tr_base
-    X_val_tune = X_val_full if use_full else X_val_base
-    feat_label = "base+CF-134" if use_full else "base-131"
-    print(f"=== Random search on {feat_label} ({n_trials} trials) ===")
-    results = random_search(X_tr_tune, y_train, X_val_tune, y_val, n_trials=n_trials)
+    print(f"=== Random search ({n_trials} trials) ===")
+    results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials)
 
-    print(f"\n=== Top-5 hyperparameter sets ({feat_label}) ===")
+    print(f"\n=== Top-5 hyperparameter sets ===")
     for rank, (val_r, best_n, params) in enumerate(results[:5], 1):
         print(f"  #{rank}  RMSE={val_r:.5f}  n_trees={best_n}")
         print(f"       {params}")
@@ -570,23 +729,22 @@ def main():
         nthread=4, verbosity=0, seed=42,
         **best_params,
     )
-    final_model.fit(X_tr_tune, np.array(y_train, dtype=np.float32))
-    xgb_preds_val = final_model.predict(X_val_tune)
+    final_model.fit(X_tr, np.array(y_train, dtype=np.float32))
+    xgb_preds_val = final_model.predict(X_val)
 
     blend_r, cw_hi, cw_lo = sweep_blend(xgb_preds_val, cf_preds_val, cf_ks_val, y_val)
     print(f"  XGB alone : RMSE={rmse(y_val, xgb_preds_val):.5f}")
-    print(f"  Best blend: RMSE={blend_r:.5f}  cw_hi(>=15 nbrs)={cw_hi}  cw_lo(>=5 nbrs)={cw_lo}")
+    print(f"  Best blend: RMSE={blend_r:.5f}  cw_hi(>=15)={cw_hi}  cw_lo(>=5)={cw_lo}")
 
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
     print("\n=== Summary ===")
-    print(f"  baseline base-131   : RMSE={r_base:.5f}")
-    print(f"  baseline base+CF-134: RMSE={r_full:.5f}")
-    print(f"  best after tuning   : RMSE={best_val_r:.5f}")
-    print(f"  best + CF blend     : RMSE={blend_r:.5f}")
+    print(f"  baseline (n=372, old params)  : RMSE={r_base:.5f}")
+    print(f"  best n w/ current params      : n={best_n_es}, RMSE={r_es:.5f}")
+    print(f"  best after full tuning        : n={best_n}, RMSE={best_val_r:.5f}")
+    print(f"  best + CF blend               : RMSE={blend_r:.5f}")
     print(f"\nRecommended for competition.py:")
-    print(f"  feature set : {feat_label}")
     print(f"  n_estimators: {best_n}")
     print(f"  params      : {best_params}")
     print(f"  cw_hi / cw_lo: {cw_hi} / {cw_lo}")

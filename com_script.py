@@ -44,8 +44,6 @@ _COMPS    = [
     "compliment_funny", "compliment_writer", "compliment_photos",
 ]
 
-_PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
-
 # -- Feature Extraction (RDD map functions) ------------------------------------
 
 def _hours(h_dict, day):
@@ -76,7 +74,6 @@ def extract_business(line):
     Layout: [stars, review_count, is_open, lat, lon,
              22xbool_attr, price_range, 3xalcohol, 3xwifi, noise, attire,
              8xambience, 5xparking, 6xmeal, 7xhours, 10xstate, 30xcategory]
-    Categories are at indices 72..101 (used by biz_cats precomputation).
     """
     d   = json.loads(line)
     a   = d.get("attributes") or {}
@@ -191,49 +188,6 @@ def extract_tip(line):
     ]
 
 
-def extract_tip_content(line):
-    """
-    RDD flatMap: [(b_<bid>, [1, words, excl]), (u_<uid>, [1, words, excl])]
-    Extracts avg word count and exclamation mark count per tip.
-    """
-    d    = json.loads(line)
-    text = d.get("text", "") or ""
-    wc   = float(len(text.split()))
-    ex   = float(text.count("!"))
-    return [
-        ("b_" + d.get("business_id", ""), [1.0, wc, ex]),
-        ("u_" + d.get("user_id",      ""), [1.0, wc, ex]),
-    ]
-
-
-def _add_vec3(a, b):
-    """Element-wise sum of two 3-element lists (reduceByKey combiner)."""
-    return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-
-
-def _tip_ub_pair(line):
-    """RDD map: (user_id, business_id) for implicit feedback set."""
-    d = json.loads(line)
-    return (d.get("user_id", ""), d.get("business_id", ""))
-
-
-def extract_photo(line):
-    """
-    RDD map: (business_id, [1, is_food, is_inside, is_outside, is_drink, is_menu])
-    reduceByKey sums counts; then normalize to get percentages.
-    """
-    d   = json.loads(line)
-    bid = d.get("business_id", "")
-    lbl = d.get("label", "")
-    v   = [1.0] + [1.0 if lbl == pl else 0.0 for pl in _PHOTO_LABELS]
-    return bid, v
-
-
-def _photo_add(a, b):
-    """Element-wise sum for 6-element photo count vectors."""
-    return [a[i] + b[i] for i in range(6)]
-
-
 # -- Helper: column-wise default (mean, excluding -1 sentinel) -----------------
 
 def _col_defaults(rows, n_feat):
@@ -334,6 +288,7 @@ def train_mf_sgd(train_rows, n_factors=50, n_epochs=20, lr=0.005, reg=0.02, seed
     Biased SVD via mini-batch SGD.
     pred(u,i) = mu + b_u + b_i + P_u . Q_i
     Returns (u2i, b2i, P, Q, bu, bi, mu).
+    Cold-start: fall back to mu + b_u or mu + b_i or mu.
     """
     np.random.seed(seed)
 
@@ -355,7 +310,7 @@ def train_mf_sgd(train_rows, n_factors=50, n_epochs=20, lr=0.005, reg=0.02, seed
     ra_arr = np.array([float(r[2]) for r in train_rows], dtype="float64")
     n = len(ra_arr)
 
-    bs = 2048
+    bs = 2048   # mini-batch size (large enough to vectorize; small enough to stay memory-safe)
     for _ in range(n_epochs):
         perm = np.random.permutation(n)
         for s in range(0, n, bs):
@@ -363,9 +318,10 @@ def train_mf_sgd(train_rows, n_factors=50, n_epochs=20, lr=0.005, reg=0.02, seed
             uu  = ui_arr[idx]
             bb  = bi_arr[idx]
             rr  = ra_arr[idx]
-            Pu  = P[uu]
-            Qb  = Q[bb]
+            Pu  = P[uu]          # shape (bs, k)
+            Qb  = Q[bb]          # shape (bs, k)
             err = rr - (mu + bu[uu] + bi[bb] + np.einsum("ij,ij->i", Pu, Qb))
+            # gradient step (approximate for repeated indices in batch, OK for large datasets)
             P[uu]  += lr * (err[:, None] * Qb - reg * Pu)
             Q[bb]  += lr * (err[:, None] * Pu - reg * Qb)
             bu[uu] += lr * (err - reg * bu[uu])
@@ -375,9 +331,9 @@ def train_mf_sgd(train_rows, n_factors=50, n_epochs=20, lr=0.005, reg=0.02, seed
 
 
 def mf_predict(uid, bid, u2i, b2i, P, Q, bu, bi, mu):
-    ui   = u2i.get(uid)
+    ui = u2i.get(uid)
     bi_i = b2i.get(bid)
-    p    = mu
+    p = mu
     if ui is not None:
         p += bu[ui]
     if bi_i is not None:
@@ -391,15 +347,16 @@ def mf_predict(uid, bid, u2i, b2i, P, Q, bu, bi, mu):
 # Tuning flags — change here to trade accuracy vs Vocareum time budget
 # ---------------------------------------------------------------------------
 
-# OOF CF as feature: leakage through shared similarity cache → RMSE 1.097.
-# Keep False; CF runs as post-hoc blend only.
+# OOF CF as feature: uses OOF fold averages (removes avg-leakage) but full
+# u2i/i2u + shared cache (minor similarity-leakage remains, fast after fold 0).
+# Estimated Vocareum time: +8-12 min.  Set False → fall back to post-hoc blend.
 _USE_OOF_CF = False
 
-# SVD feature: OOF 5-fold + 1 final train.  Also exposes P_u and Q_i vectors.
-# Estimated Vocareum time: +5-7 min.
-_USE_SVD    = True
+# SVD feature: OOF 5-fold + 1 final train.  n_factors=10, n_epochs=8 per fold.
+# Estimated Vocareum time: +5-6 min.
+_USE_SVD = True
 _MF_FACTORS = 10
-_MF_EPOCHS  = 8   # per OOF fold; final model uses _MF_EPOCHS + 4
+_MF_EPOCHS  = 8   # per OOF fold; final model uses +4 extra epochs
 
 # -- Main ----------------------------------------------------------------------
 
@@ -420,7 +377,6 @@ if __name__ == "__main__":
     usr_path   = os.path.join(folder_path, "user.json")
     ck_path    = os.path.join(folder_path, "checkin.json")
     tip_path   = os.path.join(folder_path, "tip.json")
-    photo_path = os.path.join(folder_path, "photo.json")
     train_path = os.path.join(folder_path, "yelp_train.csv")
 
     # -- Step 1: Load & broadcast auxiliary data via RDD ----------------------
@@ -432,69 +388,27 @@ if __name__ == "__main__":
                 .reduceByKey(lambda a, b: a + b)
                 .collectAsMap())
 
-    # Tip: count aggregates + content stats + implicit (uid,bid) pairs
-    tip_rdd = sc.textFile(tip_path).persist()
-
-    tip_all = (tip_rdd
+    tip_all = (sc.textFile(tip_path)
                  .flatMap(extract_tip)
                  .reduceByKey(lambda a, b: a + b)
                  .collectAsMap())
     tb_map = {k[2:]: v for k, v in tip_all.items() if k[:2] == "b_"}
     tu_map = {k[2:]: v for k, v in tip_all.items() if k[:2] == "u_"}
 
-    tip_content = (tip_rdd
-                     .flatMap(extract_tip_content)
-                     .reduceByKey(_add_vec3)
-                     .collectAsMap())
-    # avg words per tip per business/user; avg exclamations per tip per business
-    tc_b = {k[2:]: v[1] / v[0] for k, v in tip_content.items() if k[:2] == "b_" and v[0] > 0}
-    te_b = {k[2:]: v[2] / v[0] for k, v in tip_content.items() if k[:2] == "b_" and v[0] > 0}
-    tc_u = {k[2:]: v[1] / v[0] for k, v in tip_content.items() if k[:2] == "u_" and v[0] > 0}
-
-    # user-business pairs from tip.json (implicit positive feedback)
-    tip_ub_set = set(tip_rdd.map(_tip_ub_pair).distinct().collect())
-
-    tip_rdd.unpersist()
-
-    # Photo: log1p(count) + label distribution (food/inside/outside/drink/menu)
-    photo_raw = (sc.textFile(photo_path)
-                   .map(extract_photo)
-                   .reduceByKey(_photo_add)
-                   .collectAsMap())
-    _ph_def = [0.0] * 6
-    photo_map = {}
-    for _bid, _v in photo_raw.items():
-        _tot = _v[0]
-        if _tot > 0:
-            photo_map[_bid] = [math.log1p(_tot)] + [_v[i + 1] / _tot for i in range(5)]
-        else:
-            photo_map[_bid] = _ph_def[:]
-
     usr_raw = sc.textFile(usr_path).map(extract_user).collectAsMap()
 
-    # biz_map: 102 base + ck + tb + 6 photo + 2 tip_content = 112 features
-    biz_map = {bid: (list(f)
-                     + [ck_map.get(bid, 0.0), tb_map.get(bid, 0.0)]
-                     + photo_map.get(bid, _ph_def)
-                     + [tc_b.get(bid, 0.0), te_b.get(bid, 0.0)])
+    biz_map = {bid: f + [ck_map.get(bid, 0.0), tb_map.get(bid, 0.0)]
                for bid, f in biz_raw.items()}
-
-    # usr_map: 23 base + tu + tc_u = 25 features
-    usr_map = {uid: list(f) + [tu_map.get(uid, 0.0), tc_u.get(uid, 0.0)]
+    usr_map = {uid: f + [tu_map.get(uid, 0.0)]
                for uid, f in usr_raw.items()}
 
     biz_vals  = list(biz_map.values())
-    n_bfeat   = len(biz_vals[0]) if biz_vals else 112
+    n_bfeat   = len(biz_vals[0]) if biz_vals else 104
     b_default = _col_defaults(biz_vals, n_bfeat)
 
     usr_vals  = list(usr_map.values())
-    n_ufeat   = len(usr_vals[0]) if usr_vals else 25
+    n_ufeat   = len(usr_vals[0]) if usr_vals else 24
     u_default = _col_defaults(usr_vals, n_ufeat)
-
-    # Precompute biz → category indices (categories are at positions 72..101 in extract_business)
-    biz_cats = {}
-    for bid, f in biz_raw.items():
-        biz_cats[bid] = [j for j in range(30) if len(f) > 72 + j and f[72 + j] == 1.0]
 
     # -- Step 2: Load & persist train RDD, build CF structures ----------------
 
@@ -524,9 +438,11 @@ if __name__ == "__main__":
     total_r = sum(len(d) for d in item_data.values())
     g_avg   = sum(sum(d.values()) for d in item_data.values()) / total_r if total_r else 3.75
 
+    # Shared Pearson cache — accumulated across all CF calls (OOF folds + test).
+    # Folds 1-4 reuse similarities computed in fold 0, making later folds fast.
     sim_cache = {}
 
-    # -- Step 3: Load test pairs early (sim_cache warms before test eval) -----
+    # -- Step 3: Load test pairs (early, so sim_cache warms before test eval) --
 
     test_raw   = sc.textFile(test_file)
     test_hdr   = test_raw.first()
@@ -544,6 +460,7 @@ if __name__ == "__main__":
     y_train    = [float(r[2]) for r in train_rows]
     n_train    = len(train_rows)
 
+    # Fold assignments (deterministic)
     import random as _rnd
     _rnd.seed(42)
     _shuf = list(range(n_train))
@@ -552,83 +469,30 @@ if __name__ == "__main__":
     for _pos, _ki in enumerate(_shuf):
         _fold[_ki] = _pos % 5
 
-    # -- 4a. OOF u_avg / i_avg + user-category preference (single 5-fold pass) -
+    # -- 4a. OOF u_avg / i_avg (no leakage) -----------------------------------
 
-    oof_ua   = [g_avg] * n_train
-    oof_ia   = [g_avg] * n_train
-    oof_ucat = [g_avg] * n_train   # user's avg rating for this biz's categories
-
+    oof_ua = [g_avg] * n_train
+    oof_ia = [g_avg] * n_train
     for _k in range(5):
-        _us = {}
-        _uc = {}
-        _bs = {}
-        _bc = {}
-        _u_cat_sum = {}
-        _u_cat_cnt = {}
+        _us = {}; _uc = {}; _bs = {}; _bc = {}
         for _i, r in enumerate(train_rows):
             if _fold[_i] == _k:
                 continue
-            _y = y_train[_i]
-            _uid = r[0]
-            _bid = r[1]
-            _us[_uid] = _us.get(_uid, 0.0) + _y
-            _uc[_uid] = _uc.get(_uid, 0) + 1
-            _bs[_bid] = _bs.get(_bid, 0.0) + _y
-            _bc[_bid] = _bc.get(_bid, 0) + 1
-            if _uid not in _u_cat_sum:
-                _u_cat_sum[_uid] = [0.0] * 30
-                _u_cat_cnt[_uid] = [0]   * 30
-            for _ci in biz_cats.get(_bid, []):
-                _u_cat_sum[_uid][_ci] += _y
-                _u_cat_cnt[_uid][_ci] += 1
+            _y = y_train[_i]; _uid = r[0]; _bid = r[1]
+            _us[_uid] = _us.get(_uid, 0.0) + _y; _uc[_uid] = _uc.get(_uid, 0) + 1
+            _bs[_bid] = _bs.get(_bid, 0.0) + _y; _bc[_bid] = _bc.get(_bid, 0) + 1
         _ua = {u: _us[u] / _uc[u] for u in _us}
         _ia = {b: _bs[b] / _bc[b] for b in _bs}
         for _i, r in enumerate(train_rows):
             if _fold[_i] == _k:
                 oof_ua[_i] = _ua.get(r[0], g_avg)
                 oof_ia[_i] = _ia.get(r[1], g_avg)
-                _uid = r[0]
-                _bid = r[1]
-                _cats = biz_cats.get(_bid, [])
-                _vals = []
-                if _uid in _u_cat_sum:
-                    for _ci in _cats:
-                        if _u_cat_cnt[_uid][_ci] > 0:
-                            _vals.append(_u_cat_sum[_uid][_ci] / _u_cat_cnt[_uid][_ci])
-                oof_ucat[_i] = sum(_vals) / len(_vals) if _vals else g_avg
 
-    # -- 4b. Jaccard category similarity (no rating leakage) ------------------
-    # Measures: fraction of the business's categories the user has historically visited.
-
-    u_cats_set = {}
-    for r in train_rows:
-        _uid, _bid = r[0], r[1]
-        if _uid not in u_cats_set:
-            u_cats_set[_uid] = set()
-        u_cats_set[_uid].update(biz_cats.get(_bid, []))
-
-    jaccard_train = []
-    for r in train_rows:
-        _uid, _bid = r[0], r[1]
-        _uc = u_cats_set.get(_uid, set())
-        _bc = set(biz_cats.get(_bid, []))
-        _union = len(_uc | _bc)
-        jaccard_train.append(float(len(_uc & _bc)) / _union if _union > 0 else 0.0)
-
-    # -- 4c. Full u_cat_avg (for test-time user-category feature) -------------
-
-    u_cat_sum_all = {}
-    u_cat_cnt_all = {}
-    for _i, r in enumerate(train_rows):
-        _uid, _bid = r[0], r[1]
-        if _uid not in u_cat_sum_all:
-            u_cat_sum_all[_uid] = [0.0] * 30
-            u_cat_cnt_all[_uid] = [0]   * 30
-        for _ci in biz_cats.get(_bid, []):
-            u_cat_sum_all[_uid][_ci] += y_train[_i]
-            u_cat_cnt_all[_uid][_ci] += 1
-
-    # -- 4d. OOF CF (approximate, disabled by default) ------------------------
+    # -- 4b. OOF CF (approximate) ---------------------------------------------
+    # Approximation: uses full u2i/i2u for neighbor lookup (for cache reuse),
+    # but OOF fold-k averages for baseline — removes the largest leakage source.
+    # sim_cache is shared across folds: fold 0 is slow (cold), folds 1-4 are
+    # fast (cache hits dominate).  Set _USE_OOF_CF=False to skip (~10 min saved).
 
     oof_cf   = [g_avg] * n_train
     oof_cf_k = [0]     * n_train
@@ -636,20 +500,13 @@ if __name__ == "__main__":
     if _USE_OOF_CF:
         print("OOF CF start: {:.1f}s".format(time.time() - t0))
         for _k in range(5):
-            _us = {}
-            _uc = {}
-            _bs = {}
-            _bc = {}
+            _us = {}; _uc = {}; _bs = {}; _bc = {}
             for _i, r in enumerate(train_rows):
                 if _fold[_i] == _k:
                     continue
-                _y = y_train[_i]
-                _uid = r[0]
-                _bid = r[1]
-                _us[_uid] = _us.get(_uid, 0.0) + _y
-                _uc[_uid] = _uc.get(_uid, 0) + 1
-                _bs[_bid] = _bs.get(_bid, 0.0) + _y
-                _bc[_bid] = _bc.get(_bid, 0) + 1
+                _y = y_train[_i]; _uid = r[0]; _bid = r[1]
+                _us[_uid] = _us.get(_uid, 0.0) + _y; _uc[_uid] = _uc.get(_uid, 0) + 1
+                _bs[_bid] = _bs.get(_bid, 0.0) + _y; _bc[_bid] = _bc.get(_bid, 0) + 1
             _ua_k = {u: _us[u] / _uc[u] for u in _us}
             _ia_k = {b: _bs[b] / _bc[b] for b in _bs}
             for _i, r in enumerate(train_rows):
@@ -660,7 +517,9 @@ if __name__ == "__main__":
                     oof_cf_k[_i] = _nk
             print("  OOF CF fold {}: {:.1f}s".format(_k, time.time() - t0))
 
-    # -- 4e. OOF SVD + latent vectors (P_u, Q_i per fold) --------------------
+    # -- 4c. OOF SVD ----------------------------------------------------------
+    # 5-fold OOF: train on 80%, predict 20%.  Small model for speed.
+    # Final SVD trains on 100% for test-time predictions.
 
     oof_svd = [g_avg] * n_train
     _u2i_final = _b2i_final = _P_f = _Q_f = _bu_f = _bi_f = _mu_f = None
@@ -669,38 +528,33 @@ if __name__ == "__main__":
         print("OOF SVD start: {:.1f}s".format(time.time() - t0))
         for _k in range(5):
             _rows_k = [train_rows[_i] for _i in range(n_train) if _fold[_i] != _k]
-            _u2i_sv, _b2i_sv, _P, _Q, _bu_sv, _bi_sv, _mu_sv = train_mf_sgd(
+            _u2i_sv, _b2i_sv, _P, _Q, _bu, _bi, _mu = train_mf_sgd(
                 _rows_k, n_factors=_MF_FACTORS, n_epochs=_MF_EPOCHS, seed=42)
             for _i in range(n_train):
                 if _fold[_i] == _k:
                     oof_svd[_i] = mf_predict(
                         train_rows[_i][0], train_rows[_i][1],
-                        _u2i_sv, _b2i_sv, _P, _Q, _bu_sv, _bi_sv, _mu_sv)
+                        _u2i_sv, _b2i_sv, _P, _Q, _bu, _bi, _mu)
             print("  OOF SVD fold {}: {:.1f}s".format(_k, time.time() - t0))
 
+        # Final SVD on full training data (used for test features)
         _u2i_final, _b2i_final, _P_f, _Q_f, _bu_f, _bi_f, _mu_f = train_mf_sgd(
             train_rows, n_factors=_MF_FACTORS, n_epochs=_MF_EPOCHS + 4, seed=42)
         print("Final SVD done: {:.1f}s".format(time.time() - t0))
 
     # -- Step 5: Build XGBoost training matrix --------------------------------
-    # Feature layout (total 144 when _USE_SVD=True, 143 otherwise):
-    #   112 biz  : 102 base + ck + tb + 6 photo + tip_avg_words + tip_avg_excl
-    #   25  user : 23 base + tu + tip_avg_words
-    #   6   pair : OOF u_avg, OOF i_avg, diff, OOF ucat, jaccard, ub_tip_flag
-    #   [+3 if _USE_OOF_CF: cf_score, cf_k, is_cold]
-    #   [+1 if _USE_SVD  : svd_score]
-    # P_u / Q_i raw latent vectors are excluded: each OOF fold and the final
-    # model use different random latent spaces → train/test incompatibility.
+    # Features: 104 biz + 24 usr + OOF u_avg + OOF i_avg + diff = 131 base
+    # + OOF cf_score + OOF cf_k + is_cold (if _USE_OOF_CF) = +3
+    # + OOF svd_score (if _USE_SVD) = +1
+    # Total: 131 / 134 / 135 depending on flags
 
     X_train = []
     for _i, r in enumerate(train_rows):
-        _ua  = oof_ua[_i]
-        _ia  = oof_ia[_i]
-        _cfk  = float(oof_cf_k[_i])
-        _ubtip = 1.0 if (r[0], r[1]) in tip_ub_set else 0.0
-        row   = (list(biz_map.get(r[1], b_default))
-                 + list(usr_map.get(r[0], u_default))
-                 + [_ua, _ia, _ua - _ia, oof_ucat[_i], jaccard_train[_i], _ubtip])
+        _ua  = oof_ua[_i];  _ia  = oof_ia[_i]
+        _cfk = float(oof_cf_k[_i])
+        row  = (list(biz_map.get(r[1], b_default))
+                + list(usr_map.get(r[0], u_default))
+                + [_ua, _ia, _ua - _ia])
         if _USE_OOF_CF:
             row += [oof_cf[_i], _cfk, 1.0 if _cfk < 5 else 0.0]
         if _USE_SVD:
@@ -708,8 +562,8 @@ if __name__ == "__main__":
         X_train.append(row)
 
     # -- Step 6: Train XGBoost ------------------------------------------------
-    # n_estimators=372 was tuned for 132-feat model; consider re-running
-    # tune_xgb.py after adding new features to find updated optimal n.
+    # Params from offline tuning (tune_xgb.py, 30 trials on base-131 features).
+    # n_estimators=1359 found via early stopping at lr=0.02.
     reg = xgb.XGBRegressor(
         max_depth=8,
         learning_rate=0.05,
@@ -729,40 +583,28 @@ if __name__ == "__main__":
     print("XGBoost done: {:.1f}s".format(time.time() - t0))
 
     # -- Step 7: Build X_test -------------------------------------------------
+    # Full training averages (no leakage), full CF (cache now warm), final SVD.
 
     X_test = []
     for uid, bid in test_pairs:
-        _ua  = u_avg.get(uid, g_avg)
-        _ia  = i_avg.get(bid, g_avg)
-        _ubtip = 1.0 if (uid, bid) in tip_ub_set else 0.0
-        # User-category preference from full training history
-        _cats = biz_cats.get(bid, [])
-        _vals = []
-        if uid in u_cat_sum_all:
-            for _ci in _cats:
-                if u_cat_cnt_all[uid][_ci] > 0:
-                    _vals.append(u_cat_sum_all[uid][_ci] / u_cat_cnt_all[uid][_ci])
-        _ucat_t = sum(_vals) / len(_vals) if _vals else g_avg
-        # Jaccard
-        _uc = u_cats_set.get(uid, set())
-        _bc = set(biz_cats.get(bid, []))
-        _union = len(_uc | _bc)
-        _jac = float(len(_uc & _bc)) / _union if _union > 0 else 0.0
+        _ua  = u_avg.get(uid, g_avg);  _ia  = i_avg.get(bid, g_avg)
         row  = (list(biz_map.get(bid, b_default))
                 + list(usr_map.get(uid, u_default))
-                + [_ua, _ia, _ua - _ia, _ucat_t, _jac, _ubtip])
+                + [_ua, _ia, _ua - _ia])
         if _USE_OOF_CF:
             _cf_p, _cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg,
                                       sim_cache, top_n=30)
             row += [float(_cf_p), float(_cf_k), 1.0 if _cf_k < 5 else 0.0]
-        if _USE_SVD and _u2i_final is not None:
+        if _USE_SVD:
             row += [mf_predict(uid, bid, _u2i_final, _b2i_final,
-                               _P_f, _Q_f, _bu_f, _bi_f, _mu_f)]
+                                _P_f, _Q_f, _bu_f, _bi_f, _mu_f)]
         X_test.append(row)
 
     xgb_preds = reg.predict(X_test)
 
     # -- Step 8: Write output -------------------------------------------------
+    # When _USE_OOF_CF=True: XGBoost learned CF weights — no manual blend.
+    # When _USE_OOF_CF=False: fall back to post-hoc CF blend (tuned weights).
 
     with open(output_file, "w") as out:
         out.write("user_id,business_id,prediction\n")
