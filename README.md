@@ -10,7 +10,7 @@
 
 ## Current Approach (competition.py)
 
-### Features (144 total)
+### Features (119 total, after dropping 25 low-importance features)
 
 | Block | Source | Count |
 |---|---|---|
@@ -32,16 +32,16 @@
 ### XGBoost 參數
 
 ```python
-max_depth=8, learning_rate=0.05, n_estimators=372,
-subsample=0.85, colsample_bytree=0.6, min_child_weight=10,
-gamma=0.0, reg_alpha=0.5, reg_lambda=2.0,
+max_depth=7, learning_rate=0.03, n_estimators=700,
+subsample=0.75, colsample_bytree=0.6, min_child_weight=3,
+gamma=0.3, reg_alpha=1.0, reg_lambda=4.0,
 objective="reg:linear",  # Vocareum 舊版不支援 reg:squarederror
 nthread=4, seed=42
 ```
 
-- `n_estimators=372`：用 132-feat OOF SVD 版本 + early stopping (patience=50) 在 yelp_val.csv 上找到；144-feat 版本沿用，尚未重新 tune。
-- 加入 SVD 特徵後最佳 n 從 474 降到 372（SVD 提供額外信號，收斂更快）。
-- `colsample_bytree=0.6`, `min_child_weight=10`, `reg_alpha=0.5`：tune_xgb.py 30-trial random search 找到的更強正規化組合。
+- `n_estimators=700`：tune_xgb.py safe-mode（50 trials, lr≥0.03, n≤700）在 119-feat 版本上找到，撞到上限，真正最佳 n 可能略高。
+- 119 feat → XGBoost 比 144 feat 快 ~17%，Vocareum 估計 ~11-14 分鐘。
+- CF blend：cw_hi=0.10（≥15 鄰居），cw_lo=0.05（≥5 鄰居）。
 
 ### OOF SVD（biased SVD via mini-batch SGD）
 
@@ -77,7 +77,8 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | competition.py (OOF 131 feat) | OOF u_avg/i_avg, n=474, lr=0.05 | 0.9747 |
 | competition.py (132 feat) | 132 feat + OOF SVD, n=372, lr=0.05 + CF blend | 0.9742 |
 | competition.py (164 feat，失敗) | +P_u/Q_i 原始向量（空間不兼容）→ timeout | 2.94（miss:125789） |
-| **competition.py（目前最佳）** | 144 feat + photo/tip/ucat/jaccard/ub_tip, n=372 | **0.9726** |
+| competition.py (144 feat) | photo/tip/ucat/jaccard/ub_tip, n=372 | 0.9726 |
+| **competition.py（目前最佳）** | 119 feat（刪25個低重要度）, n=700, lr=0.03 | **待測** |
 
 ## 已嘗試但無效的方法
 
@@ -105,7 +106,8 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | 128 feat + CF 0.25/0.15 | 0.97496 | 0.9751 |
 | 131 feat OOF + n=474 + CF 0.25/0.15 | 0.97465 | 0.9747 |
 | 132 feat OOF SVD + n=372 + CF 0.15/0.05 | 0.9739 | 0.9742 |
-| **144 feat + photo/tip/ucat/jaccard/ub_tip** | **0.9726** | **0.9726** |
+| 144 feat + photo/tip/ucat/jaccard/ub_tip | 0.9726 | 0.9726 |
+| 75 feat, n=500, lr=0.03 (新參數)** | 0.97151 | 0.9724 |
 
 ## 下一步可能的改善方向
 
@@ -114,6 +116,8 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | re-tune n_estimators（針對 144-feat）| 可能 −0.001～−0.002 | 極低（跑 tune_xgb.py） |
 | ALS Matrix Factorization（取代 SGD MF） | −0.003～−0.008 | 中 |
 | 社交特徵（朋友對同一 business 的評分） | −0.002～−0.004 | 中 |
+| TF-IDF（評論分析） | −0.002～−0.004 | 中 |
+
 
 ## 環境注意事項
 
@@ -125,4 +129,4 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 ## 同學成績參考
 
 - 同學最佳：RMSE = 0.9333（推測使用 LightGCN / Neural CF / ALS+implicit）
-- 我們目前最佳 Vocareum：**0.9726**
+- 我們目前最佳 Vocareum：**0.9724**

@@ -63,6 +63,21 @@ _COMPS    = [
 ]
 _PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
 
+# Must mirror competition.py exactly.
+_DROP_FEAT_IDX = frozenset([
+    2,
+    8, 11, 12, 13, 22, 23,
+    28,
+    31, 32,
+    47, 48,
+    52,
+    62, 69,
+    74, 80, 94,
+    105, 108,
+    123, 124, 125, 126,
+    141,
+])
+
 _USE_SVD    = True
 _MF_FACTORS = 10
 _MF_EPOCHS  = 8
@@ -470,7 +485,7 @@ def build_features(rows, biz_map, usr_map, u_avg, i_avg, g_avg,
             u2i_f, b2i_f, P, Q, bu, bi, mu = svd_params
             feat.append(mf_predict(uid, bid, u2i_f, b2i_f, P, Q, bu, bi, mu))
 
-        X.append(feat)
+        X.append([v for i, v in enumerate(feat) if i not in _DROP_FEAT_IDX])
         cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache)
         cf_preds.append(cf_p)
         cf_ks.append(float(cf_k))
@@ -492,6 +507,59 @@ def rmse(y_true, y_pred):
 # Hyperparameter random search
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Feature names (must match build_features layout exactly)
+# ---------------------------------------------------------------------------
+
+def get_feature_names(use_svd=True):
+    """Returns names for the full 144/143-feature vector before masking."""
+    names = []
+    # Business base (102)
+    names += ["b_stars", "b_review_count", "b_is_open", "b_latitude", "b_longitude"]
+    for b in _BOOL_ATTRS:
+        names.append("b_" + b.lower())
+    names.append("b_price_range")
+    names += ["b_alc_none", "b_alc_beer_wine", "b_alc_full_bar"]
+    names += ["b_wifi_no", "b_wifi_free", "b_wifi_paid"]
+    names += ["b_noise", "b_attire"]
+    for k in _AMBIENCE:
+        names.append("b_amb_" + k)
+    for k in _PARKING:
+        names.append("b_park_" + k)
+    for k in _MEAL:
+        names.append("b_meal_" + k)
+    for d in _DAYS:
+        names.append("b_hours_" + d[:3].lower())
+    for s in _TOP_STATES:
+        names.append("b_state_" + s.lower())
+    for c in _TOP_CATS:
+        names.append("b_cat_" + c.lower().replace(" ", "_").replace("&", "and").replace("/", "_")[:20])
+    # Business extended (10)
+    names += ["b_checkin_count", "b_tip_count"]
+    names += ["b_photo_log1p", "b_photo_food_r", "b_photo_inside_r",
+              "b_photo_outside_r", "b_photo_drink_r", "b_photo_menu_r"]
+    names += ["b_tip_avg_words", "b_tip_avg_excl"]
+    # User (25)
+    names += ["u_review_count", "u_avg_stars", "u_fans",
+              "u_useful", "u_funny", "u_cool", "u_tenure",
+              "u_friend_log", "u_is_elite", "u_elite_yrs"]
+    for k in _COMPS:
+        names.append("u_" + k)
+    names += ["u_total_comps", "u_engagement", "u_tip_count", "u_tip_avg_words"]
+    # Pair (6)
+    names += ["oof_u_avg", "oof_i_avg", "diff_ua_ia",
+              "oof_ucat", "jaccard", "ub_tip_flag"]
+    # SVD (1)
+    if use_svd:
+        names.append("svd_score")
+    # Apply same drop mask as build_features
+    return [n for i, n in enumerate(names) if i not in _DROP_FEAT_IDX]
+
+# ---------------------------------------------------------------------------
+# Hyperparameter search grids
+# ---------------------------------------------------------------------------
+
+# Unconstrained search (local only — lr=0.02 yields n>600 which crashes Vocareum)
 PARAM_GRID = {
     "max_depth":        [6, 7, 8, 9, 10],
     "learning_rate":    [0.02, 0.03, 0.05, 0.07, 0.1],
@@ -503,17 +571,33 @@ PARAM_GRID = {
     "reg_lambda":       [1.0, 1.5, 2.0, 3.0, 4.0],
 }
 
+# Vocareum-safe search: lr≥0.03 so n naturally stays ≤600-700.
+# On Vocareum, n=372 → XGBoost ~448s; n=700 → ~840s; limit is ~25min total.
+PARAM_GRID_VOCAREUM = {
+    "max_depth":        [6, 7, 8, 9],
+    "learning_rate":    [0.03, 0.05],
+    "subsample":        [0.65, 0.7, 0.75, 0.8, 0.85],
+    "colsample_bytree": [0.5, 0.6, 0.7, 0.8],
+    "min_child_weight": [3, 5, 7, 10, 15],
+    "gamma":            [0.0, 0.05, 0.1, 0.2, 0.3],
+    "reg_alpha":        [0.0, 0.05, 0.1, 0.2, 0.5, 1.0],
+    "reg_lambda":       [1.0, 1.5, 2.0, 3.0, 4.0],
+}
 
-def random_search(X_tr, y_tr, X_val, y_val, n_trials=30, seed=42):
+
+def random_search(X_tr, y_tr, X_val, y_val, n_trials=30, seed=42,
+                  param_grid=None, max_n=1500):
+    if param_grid is None:
+        param_grid = PARAM_GRID
     rng      = random.Random(seed)
     y_tr_np  = np.array(y_tr, dtype=np.float32)
     y_val_np = np.array(y_val, dtype=np.float32)
     results  = []
 
     for trial in range(n_trials):
-        params = {k: rng.choice(v) for k, v in PARAM_GRID.items()}
+        params = {k: rng.choice(v) for k, v in param_grid.items()}
         model  = xgb.XGBRegressor(
-            n_estimators=1500,
+            n_estimators=max_n,
             early_stopping_rounds=50,
             objective="reg:squarederror",
             nthread=4,
@@ -566,10 +650,12 @@ def sweep_blend(xgb_preds, cf_preds, cf_ks, y_val):
 
 def main():
     if len(sys.argv) < 2:
-        sys.exit("Usage: python src/tune_xgb.py <data_folder> [n_trials=30]")
+        sys.exit("Usage: python src/tune_xgb.py <data_folder> [n_trials=30] [safe] [top_k=0]")
 
-    folder   = sys.argv[1]
-    n_trials = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    folder    = sys.argv[1]
+    n_trials  = int(sys.argv[2]) if len(sys.argv) > 2 else 30
+    safe_mode = len(sys.argv) > 3 and sys.argv[3].lower() == "safe"
+    top_k     = int(sys.argv[4]) if len(sys.argv) > 4 else 0  # 0 = keep all
 
     t0 = time.time()
     print("=== Loading data ===")
@@ -687,7 +773,43 @@ def main():
     )
     m_base.fit(X_tr, np.array(y_train, dtype=np.float32))
     r_base = rmse(y_val, m_base.predict(X_val))
-    print(f"  n=372 (old params): RMSE={r_base:.5f}\n")
+    print(f"  n=372 (old params): RMSE={r_base:.5f}")
+
+    feat_names = get_feature_names(use_svd=_USE_SVD)
+    importance  = m_base.feature_importances_
+    fi_pairs    = sorted(zip(feat_names, importance), key=lambda x: x[1], reverse=True)
+    print(f"\n  Top-20 features:")
+    for name, imp in fi_pairs[:20]:
+        print(f"    {imp:.4f}  {name}")
+    print(f"\n  Bottom-30 features (candidates for removal):")
+    for name, imp in fi_pairs[-30:]:
+        print(f"    {imp:.4f}  {name}")
+    zero_feats = [name for name, imp in fi_pairs if imp == 0.0]
+    print(f"\n  Zero-importance features ({len(zero_feats)}): {zero_feats}")
+
+    # -----------------------------------------------------------------------
+    # Optional top-k feature selection (applied on top of _DROP_FEAT_IDX)
+    # -----------------------------------------------------------------------
+    n_feat = X_tr.shape[1]
+    if top_k > 0 and top_k < n_feat:
+        # fi_pairs is sorted desc by importance; col order matches feat_names which
+        # already reflects the post-_DROP_FEAT_IDX ordering from build_features.
+        # We need the original column index (0..n_feat-1) for each feature.
+        fi_with_idx = sorted(enumerate(importance), key=lambda x: x[1], reverse=True)
+        keep_cols   = sorted(idx for idx, _ in fi_with_idx[:top_k])
+        drop_cols   = sorted(idx for idx, _ in fi_with_idx[top_k:])
+        print(f"\n  top_k={top_k}: dropping {len(drop_cols)} features")
+        print(f"  Dropped ({drop_cols[:5]}...): "
+              + ", ".join(feat_names[i] for i in drop_cols[:8]) + "...")
+        # Map back to global (144-space) indices for competition.py reference
+        keep_144 = [i for i in range(144 if _USE_SVD else 143) if i not in _DROP_FEAT_IDX]
+        extra_drop_144 = sorted(keep_144[i] for i in drop_cols)
+        print(f"  Add to _DROP_FEAT_IDX in competition.py: {extra_drop_144}")
+        X_tr  = X_tr[:, keep_cols]
+        X_val = X_val[:, keep_cols]
+        print(f"  New feature dim: {X_tr.shape[1]}\n")
+    else:
+        print()
 
     # -----------------------------------------------------------------------
     # Find optimal n with current params (early stopping, quick)
@@ -708,15 +830,25 @@ def main():
     print(f"  best n={best_n_es}, RMSE={r_es:.5f}\n")
 
     # -----------------------------------------------------------------------
-    # Random search (full param sweep)
+    # Random search
     # -----------------------------------------------------------------------
-    print(f"=== Random search ({n_trials} trials) ===")
-    results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials)
+    if safe_mode:
+        print(f"=== Vocareum-safe random search (lr≥0.03, n≤700, {n_trials} trials) ===")
+        results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials,
+                                param_grid=PARAM_GRID_VOCAREUM, max_n=700)
+    else:
+        print(f"=== Random search (unconstrained, {n_trials} trials) ===")
+        results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials)
 
     print(f"\n=== Top-5 hyperparameter sets ===")
     for rank, (val_r, best_n, params) in enumerate(results[:5], 1):
         print(f"  #{rank}  RMSE={val_r:.5f}  n_trees={best_n}")
         print(f"       {params}")
+
+    if not results:
+        print("(no trials run — skipping blend sweep and summary)")
+        print(f"\nTotal elapsed: {time.time()-t0:.1f}s")
+        return
 
     # -----------------------------------------------------------------------
     # CF blend weight sweep using best-found params
@@ -739,10 +871,11 @@ def main():
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------
+    mode_label = "Vocareum-safe (n≤700, lr≥0.03)" if safe_mode else "unconstrained"
     print("\n=== Summary ===")
     print(f"  baseline (n=372, old params)  : RMSE={r_base:.5f}")
     print(f"  best n w/ current params      : n={best_n_es}, RMSE={r_es:.5f}")
-    print(f"  best after full tuning        : n={best_n}, RMSE={best_val_r:.5f}")
+    print(f"  best after {mode_label} tuning: n={best_n}, RMSE={best_val_r:.5f}")
     print(f"  best + CF blend               : RMSE={blend_r:.5f}")
     print(f"\nRecommended for competition.py:")
     print(f"  n_estimators: {best_n}")
