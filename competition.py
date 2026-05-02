@@ -437,20 +437,59 @@ if __name__ == "__main__":
     sim_cache = {}
 
     # -- Step 4: Build XGBoost training data (Python-side, no JVM) -----------
-    # Collect only lightweight string triples (~22 MB), then do dict lookups
-    # in Python. Avoids broadcasting large feature maps through JVM heap.
     train_rows = train_rdd.collect()
-    X_train = [list(biz_map.get(r[1], b_default)) + list(usr_map.get(r[0], u_default))
-               for r in train_rows]
-    y_train = [float(r[2]) for r in train_rows]
+    y_train    = [float(r[2]) for r in train_rows]
+    n_train    = len(train_rows)
+
+    # 5-fold OOF u_avg / i_avg: eliminates data leakage while still giving
+    # XGBoost the training-set signal for user/business rating tendencies.
+    import random as _rnd
+    _rnd.seed(42)
+    _shuf = list(range(n_train))
+    _rnd.shuffle(_shuf)
+    _fold = [0] * n_train
+    for _pos, _ki in enumerate(_shuf):
+        _fold[_ki] = _pos % 5
+
+    oof_ua = [g_avg] * n_train
+    oof_ia = [g_avg] * n_train
+    for _k in range(5):
+        _us = {}
+        _uc = {}
+        _bs = {}
+        _bc = {}
+        for _i, r in enumerate(train_rows):
+            if _fold[_i] == _k:
+                continue
+            _y = y_train[_i]
+            _uid = r[0]
+            _bid = r[1]
+            _us[_uid] = _us.get(_uid, 0.0) + _y
+            _uc[_uid] = _uc.get(_uid, 0) + 1
+            _bs[_bid] = _bs.get(_bid, 0.0) + _y
+            _bc[_bid] = _bc.get(_bid, 0) + 1
+        _ua = {u: _us[u] / _uc[u] for u in _us}
+        _ia = {b: _bs[b] / _bc[b] for b in _bs}
+        for _i, r in enumerate(train_rows):
+            if _fold[_i] == _k:
+                oof_ua[_i] = _ua.get(r[0], g_avg)
+                oof_ia[_i] = _ia.get(r[1], g_avg)
+
+    X_train = []
+    for _i, r in enumerate(train_rows):
+        _ua = oof_ua[_i]
+        _ia = oof_ia[_i]
+        X_train.append(list(biz_map.get(r[1], b_default))
+                       + list(usr_map.get(r[0], u_default))
+                       + [_ua, _ia, _ua - _ia])
 
     # -- Step 5: Train XGBoost --------------------------------------------------
-    # Tuned params: depth=8 + n=430 found via grid search + early stopping
-    # on yelp_val.csv (val RMSE improved from 0.9774 -> 0.9759).
+    # 131 features (128 base + u_avg_train OOF + i_avg_train OOF + diff).
+    # n_estimators=474 found via early stopping on 131-feat model.
     reg = xgb.XGBRegressor(
         max_depth=8,
         learning_rate=0.05,
-        n_estimators=430,
+        n_estimators=474,
         subsample=0.8,
         colsample_bytree=0.8,
         min_child_weight=5,
@@ -474,21 +513,27 @@ if __name__ == "__main__":
                   .collect())
 
     # -- Step 7: Batch XGBoost prediction -------------------------------------
-    X_test    = [list(biz_map.get(bid, b_default)) + list(usr_map.get(uid, u_default))
-                 for uid, bid in test_pairs]
+    # Test features use full training averages (no leakage at prediction time).
+    X_test = []
+    for uid, bid in test_pairs:
+        _ua = u_avg.get(uid, g_avg)
+        _ia = i_avg.get(bid, g_avg)
+        X_test.append(list(biz_map.get(bid, b_default))
+                      + list(usr_map.get(uid, u_default))
+                      + [_ua, _ia, _ua - _ia])
     xgb_preds = reg.predict(X_test)
 
     # -- Step 8: XGBoost + CF blend & write output -----------------------------
-    # CF weight scales with neighbour count; XGBoost dominates otherwise.
+    # CF weights tuned on val set sweep: 0.25 (>=15 nbrs), 0.15 (>=5 nbrs).
     with open(output_file, "w") as out:
         out.write("user_id,business_id,prediction\n")
         for (uid, bid), xgb_p in zip(test_pairs, xgb_preds):
             cf_p, cf_k = cf_predict(uid, bid, u2i, i2u, u_avg, i_avg, g_avg, sim_cache, top_n=30)
 
             if cf_k >= 15:
-                cw = 0.15
+                cw = 0.25
             elif cf_k >= 5:
-                cw = 0.08
+                cw = 0.15
             else:
                 cw = 0.0
 
