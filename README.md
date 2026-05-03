@@ -78,7 +78,9 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | competition.py (132 feat) | 132 feat + OOF SVD, n=372, lr=0.05 + CF blend | 0.9742 |
 | competition.py (164 feat，失敗) | +P_u/Q_i 原始向量（空間不兼容）→ timeout | 2.94（miss:125789） |
 | competition.py (144 feat) | photo/tip/ucat/jaccard/ub_tip, n=372 | 0.9726 |
-| **competition.py（目前最佳）** | 75 feat, n=500, lr=0.03 | **0.9725** |
+| competition.py（目前最佳） | 75 feat, n=700, lr=0.03 | 0.9723 |
+| competition.py | 75 feat, n=900, lr=0.03 | **0.97229** |
+| **competition.py（目前最佳）** | 50 feat, n=800, lr=0.03 | **0.97216** |
 
 ## 已嘗試但無效的方法
 
@@ -90,7 +92,7 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | interaction features（b_stars × u_avg_stars 等） | val RMSE 0.97786 | XGBoost 深度節點已隱式捕捉交互 |
 | StandardScaler on top-10 features | 無效 | Tree-based 模型對 monotonic 縮放不敏感 |
 | OOF CF 作為特徵（approximate，full i2u） | val RMSE 1.097 | Pearson sim 仍用 full i2u，leakage 未完全消除 |
-| n=1359, lr=0.02（更多樹、低學習率） | local 0.9733，Vocareum 崩潰 | 樹太多，超過 Vocareum 記憶體/時間限制 |
+
 
 ## 最重要的特徵
 
@@ -107,7 +109,9 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 | 131 feat OOF + n=474 + CF 0.25/0.15 | 0.97465 | 0.9747 |
 | 132 feat OOF SVD + n=372 + CF 0.15/0.05 | 0.9739 | 0.9742 |
 | 144 feat + photo/tip/ucat/jaccard/ub_tip | 0.9726 | 0.9726 |
-| 75 feat, n=500, lr=0.03 (新參數)** | 0.97151 | 0.9725 |
+| 75 feat, n=700, lr=0.03 (新參數)** | 0.97151 | 0.9723 |
+| 75 feat, n=900, lr=0.03 (新參數)** | 0.97151 | 0.97229 |
+| 50 feat, n=800, lr=0.03 (新參數)** | -- | 0.97216 |
 
 ## 下一步可能的改善方向
 
@@ -129,4 +133,4 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 ## 同學成績參考
 
 - 同學最佳：RMSE = 0.9333（推測使用 LightGCN / Neural CF / ALS+implicit）
-- 我們目前最佳 Vocareum：**0.9724**
+- 我們目前最佳 Vocareum：**0.97216**

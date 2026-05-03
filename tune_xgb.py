@@ -65,6 +65,7 @@ _PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
 
 # Must mirror competition.py exactly.
 _DROP_FEAT_IDX = frozenset([
+    # Round 1: zero/very-low importance (144→119)
     2,
     8, 11, 12, 13, 22, 23,
     28,
@@ -76,6 +77,36 @@ _DROP_FEAT_IDX = frozenset([
     105, 108,
     123, 124, 125, 126,
     141,
+    # Round 2: bottom-44 of remaining 119 by importance (119→75)
+    5, 6, 7, 9, 15,
+    29, 30,
+    33,
+    39, 41,
+    45,
+    50, 51,
+    53, 54, 55, 56, 57, 58,
+    60, 61,
+    70, 71,
+    81, 82,
+    86,
+    89,
+    93,
+    96,
+    104,
+    106, 107,
+    109, 110, 111,
+    115, 116, 117, 118,
+    121,
+    127,
+    129,
+    132,
+    136,
+    # Round 3: bottom-25 of remaining 75 by weight importance (75→50)
+    25, 36, 37, 38, 40, 42, 46,
+    63, 65, 66, 67, 68,
+    76, 77, 78,
+    83, 84, 87, 88, 90, 91, 92,
+    97, 99, 101,
 ])
 
 _USE_SVD    = True
@@ -833,9 +864,9 @@ def main():
     # Random search
     # -----------------------------------------------------------------------
     if safe_mode:
-        print(f"=== Vocareum-safe random search (lr≥0.03, n≤700, {n_trials} trials) ===")
+        print(f"=== Vocareum-safe random search (lr≥0.03, n≤800, {n_trials} trials) ===")
         results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials,
-                                param_grid=PARAM_GRID_VOCAREUM, max_n=700)
+                                param_grid=PARAM_GRID_VOCAREUM, max_n=800)
     else:
         print(f"=== Random search (unconstrained, {n_trials} trials) ===")
         results = random_search(X_tr, y_train, X_val, y_val, n_trials=n_trials)

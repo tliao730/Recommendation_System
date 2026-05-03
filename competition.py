@@ -50,6 +50,7 @@ _PHOTO_LABELS = ["food", "inside", "outside", "drink", "menu"]
 # Indices are in the full 144-feature vector (when _USE_SVD=True).
 # Round 1 (25 dropped, importance ≤ 0.004): 144 → 119
 # Round 2 (44 more dropped, bottom-44 of 119 by importance): 119 → 75
+# Round 3 (25 more dropped, bottom-25 of 75 by weight importance): 75 → 50
 _DROP_FEAT_IDX = frozenset([
     # Round 1: zero/very-low importance (144→119)
     2,                       # b_is_open (always 1, zero importance)
@@ -87,6 +88,12 @@ _DROP_FEAT_IDX = frozenset([
     129,                     # u_elite_yrs
     132,                     # u_tip_avg_words
     136,                     # u_compliment_photos
+    # Round 3: bottom-25 of remaining 75 by weight importance (75→50)
+    25, 36, 37, 38, 40, 42, 46,   # b_corkage, b_amb_romantic, b_amb_intimate, b_amb_classy, b_amb_touristy, b_amb_upscale, b_park_garage
+    63, 65, 66, 67, 68,           # b_state_NV, b_state_NC, b_state_OH, b_state_PA, b_state_QC
+    76, 77, 78,                   # b_cat_home_services, b_cat_health_medical, b_cat_local_services
+    83, 84, 87, 88, 90, 91, 92,   # b_cat_active_life, b_cat_fashion, b_cat_hair_salons, b_cat_fast_food_kept, b_cat_pizza, b_cat_home_garden, b_cat_hotels_travel_kept
+    97, 99, 101,                  # b_cat_hotels_travel, b_cat_chinese, b_cat_grocery
 ])
 
 # -- Feature Extraction (RDD map functions) ------------------------------------
@@ -756,7 +763,7 @@ if __name__ == "__main__":
     reg = xgb.XGBRegressor(
         max_depth=7,
         learning_rate=0.03,
-        n_estimators=700,
+        n_estimators=800,
         subsample=0.75,
         colsample_bytree=0.6,
         min_child_weight=3,
