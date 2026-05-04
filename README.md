@@ -130,7 +130,3 @@ _USE_SVD    = True   # OOF SVD 作為特徵
 - **tune_xgb.py** 在 local 用 `objective="reg:squarederror"`，competition.py 用 `"reg:linear"`
 - n=1359 在 Vocareum 會崩潰（記憶體/時間超限），安全上限約 n=500～600
 
-## 同學成績參考
-
-- 同學最佳：RMSE = 0.9333（推測使用 LightGCN / Neural CF / ALS+implicit）
-- 我們目前最佳 Vocareum：**0.97216**
